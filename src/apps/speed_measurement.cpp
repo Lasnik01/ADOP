@@ -30,43 +30,6 @@ void initSaiga() {
     window.release();
 }
 
-void renderScene(std::unique_ptr<RealTimeRenderer> *neural_renderer, std::shared_ptr<SceneData> *scene, double* data)
-{
-    ImageInfo fd;
-    fd.w              = scene->get()->scene_cameras[0].w * scene->get()->dataset_params.render_scale;
-    fd.h              = scene->get()->scene_cameras[0].h * scene->get()->dataset_params.render_scale;
-    fd.K              = scene->get()->scene_cameras[0].K;
-    fd.distortion     = scene->get()->scene_cameras[0].distortion;
-    fd.ocam           = scene->get()->scene_cameras[0].ocam.cast<float>();
-    fd.crop_transform = fd.crop_transform.scale(scene->get()->dataset_params.render_scale);
-    // fd.pose           = Sophus::SE3f::fitToSE3(scene_camera.model * GL2CVView()).cast<double>();
-    fd.w = fd.w * render_scale;
-    fd.h = fd.h * render_scale;
-    fd.K = fd.K.scale(render_scale);
-    // fd.exposure_value = renderer->tone_mapper.params.exposure_value;
-    // fd.white_balance  = renderer->tone_mapper.params.white_point;
-    // neural_renderer->tone_mapper.params      = renderer->tone_mapper.params;
-    // neural_renderer->tone_mapper.tm_operator = renderer->tone_mapper.tm_operator;
-    neural_renderer->get()->tone_mapper.params.exposure_value -= scene->get()->dataset_params.scene_exposure_value;
-    neural_renderer->get()->tone_mapper.params_dirty = true;
-
-    auto& f = scene->get()->frames[selected_cam];
-    fd.pose = Sophus::SE3f::fitToSE3(f.OpenglModel() * GL2CVView()).cast<double>();
-
-    for (int i = 0; i < skip_cycles; i++)
-    {
-        neural_renderer->get()->Render(fd);
-    }
-    for (int i = 0; i < num_cycles; i++)
-    {
-        Timer timer_frame;
-        timer_frame.start();
-        neural_renderer->get()->Render(fd);
-        timer_frame.stop();
-        data[i * num_timers + 0] = timer_frame.getTimeMS();
-    }
-}
-
 std::string GetCurrentTimeForFileName()
 {
     auto time = std::time(nullptr);
@@ -77,35 +40,8 @@ std::string GetCurrentTimeForFileName()
     return s;
 }
 
-void storeResult(std::string path, double time_render, double* data, std::shared_ptr<SceneData>* scene, double* data_ges)
+void storeResult(std::string path, double time_render, std::shared_ptr<SceneData>* scene, CUDA::CudaTimerSystem* timer_system)
 {
-    double *time_sum = new double[num_timers];
-    double *time_avg = new double[num_timers];
-    double *time_sd = new double[num_timers];
-    for (int i = 0; i < num_cycles; i++)
-    {
-        for (int j = 0; j < num_timers; j++)
-        {
-            time_sum[j] += data[i * num_timers + j];
-        }
-    }
-    for (int j = 0; j < num_timers; j++)
-    {
-        time_avg[j] = time_sum[j]/num_cycles;
-        data_ges[j] = time_avg[j];
-    }
-    for (int i = 0; i < num_cycles; i++)
-    {
-        for (int j = 0; j < num_timers; j++)
-        {
-            time_sd[j] += pow(data[i * num_timers + j] - time_avg[j], 2);
-        }
-    }
-    for (int j = 0; j < num_timers; j++)
-    {
-        time_sd[j] = sqrt(time_sd[j]/(num_cycles-1));
-    }
-
     std::ofstream file(path + "result_camera" + std::to_string(selected_cam) + ".txt");
     file << "Speed Measurement"
          << "\n"
@@ -126,52 +62,67 @@ void storeResult(std::string path, double time_render, double* data, std::shared
     file << "\n";
     file << "Result:\n";
     file << "\n";
-    for (int i = 0; i < num_timers; i++)
-    {
-        file << timers_names[i] << ": " << time_sum[i] << " (avg.: " << time_avg[i] << "; SD.: " << time_sd[i] << ")\n"; 
-    }
+    timer_system->PrintTable(file);
     file << "\n";
-    file << "\n";
-    file << "Values:\n";
-    file << "\n";
-    for (int i = 0; i < num_cycles; i++)
-    {
-        file << "Frame" << i + 1 << ": ";
-        for (int j = 0; j < num_timers; j++)
-        {
-            file << data[i * num_timers + j] << "; ";
-        }
-        file << "\n";
-    }
     file.close();
 }
 
-void storeResultGes(std::string path, double time_ges, double* data_ges, std::shared_ptr<SceneData>* scene)
+const std::vector<std::string> explode(const std::string& s, const char& c)
 {
-    double* time_sum = new double[num_timers];
-    double* time_avg = new double[num_timers];
-    double* time_sd  = new double[num_timers];
-    for (int i = 0; i < num_cams; i++)
+    std::string buff{""};
+    std::vector<std::string> v;
+
+    for (auto n : s)
     {
-        for (int j = 0; j < num_timers; j++)
+        if (n != c)
+            buff += n;
+        else if (n == c && buff != "")
         {
-            time_sum[j] += data_ges[i * num_timers + j];
+            v.push_back(buff);
+            buff = "";
         }
     }
-    for (int j = 0; j < num_timers; j++)
+    if (buff != "") v.push_back(buff);
+
+    return v;
+}
+
+void storeResultGes(std::string path, double time_ges, std::shared_ptr<SceneData>* scene)
+{
+    std::vector<std::string> names;
+    std::vector<std::vector<float>> values;
     {
-        time_avg[j] = time_sum[j] / num_cams;
-    }
-    for (int i = 0; i < num_cams; i++)
-    {
-        for (int j = 0; j < num_timers; j++)
+        for (const auto& file : std::filesystem::directory_iterator(path))
         {
-            time_sd[j] += pow(data_ges[i * num_timers + j] - time_avg[j], 2);
+            if (file.is_regular_file() && file.path().extension() == ".txt")
+            {
+                std::ifstream res;
+                res.open(file.path());
+                std::string read;
+                for (size_t i = 0; i < 16; i++)
+                {
+                    getline(res, read);
+                }
+                while (!res.eof())
+                {
+                    getline(res, read);
+                    std::vector<std::string> vals = explode(read, '\0');
+                    if (vals.size() == 6)
+                    {
+                        std::vector<std::string>::iterator it = std::find(names.begin(), names.end(), vals[0]);
+                        auto index = std::distance(names.begin(), it);
+                        if (index == names.size())
+                        {
+                            names.push_back(vals[0]);
+                            values.push_back({});
+                        }
+                        values[index].push_back(std::stof(vals[2]));
+                    }
+
+                }
+                res.close();
+            }
         }
-    }
-    for (int j = 0; j < num_timers; j++)
-    {
-        time_sd[j] = sqrt(time_sd[j] / (num_cams - 1));
     }
 
     std::ofstream file(path + "result.txt");
@@ -194,30 +145,30 @@ void storeResultGes(std::string path, double time_ges, double* data_ges, std::sh
     file << "\n";
     file << "Result:\n";
     file << "\n";
-    for (int i = 0; i < num_timers; i++)
+
+    Table tab({30, 5, 10, 10, 10, 10}, file);
+    tab.setFloatPrecision(5);
+    tab << "Name"
+        << "N"
+        << "Mean"
+        << "Median"
+        << "Min"
+        << "Max";
+
+    for (size_t i = 0; i < values.size(); i++)
     {
-        file << timers_names[i] << ": " << time_sum[i] * num_cycles << " (avg.: " << time_avg[i] << "; SD.: " << time_sd[i] << ")\n";
+        Statistics st(values[i]);
+        tab << names[i] << values[i].size() << st.mean << st.median << st.min << st.max;
     }
+
     file << "\n";
-    file << "\n";
-    file << "Values(Avg.):\n";
-    file << "\n";
-    for (int i = 0; i < num_cams; i++)
-    {
-        file << "Camera" << selected_cam - num_cams + i << ": ";
-        for (int j = 0; j < num_timers; j++)
-        {
-            file << data_ges[i * num_timers + j] << "; ";
-        }
-        file << "\n";
-    }
     file.close();
 }
 
 int main(int argc, char* argv[])
 {
     std::cout << "*ADOP Speed Measurement for Scenes*" << std::endl;
-
+    
     //---
     //Handle Arguments
     //---
@@ -232,89 +183,265 @@ int main(int argc, char* argv[])
     app.add_option("--all_cams", all_cams, "Measure all available cameras");
     CLI11_PARSE(app, argc, argv);
 
-
     initSaiga();
-   
-   
+
     //---
-    //Load Scene and Create Renderer
+    // Load Scene and Create Renderer
     //---
-    std::cout << "*Loading Scene " << scene_dir << "*" << std::endl;
-    std::shared_ptr<SceneData> scene = std::make_shared<SceneData>(scene_dir);
-    std::cout << "*Create Renderer*" << std::endl;
-    std::unique_ptr<RealTimeRenderer> neural_renderer = std::make_unique<RealTimeRenderer>(scene);
-    if (selected_cam >= scene->frames.size())
+
+    // Scene erstellen
+    std::shared_ptr<SceneData> scene;
     {
-        selected_cam = scene->frames.size() - 1;
-    }
-    if (num_cams > scene->frames.size() - selected_cam)
-    {
-        num_cams = scene->frames.size() - selected_cam;
-    }
-    if (all_cams)
-    {
-        selected_cam = 0;
-        num_cams     = scene->frames.size();
+        scene = std::make_shared<SceneData>(scene_dir);
+        if (selected_cam >= scene->frames.size())
+        {
+            selected_cam = scene->frames.size() - 1;
+        }
+        if (num_cams > scene->frames.size() - selected_cam)
+        {
+            num_cams = scene->frames.size() - selected_cam;
+        }
+        if (all_cams)
+        {
+            selected_cam = 0;
+            num_cams     = scene->frames.size();
+        }
     }
 
+    //Experiments erstellen
+    std::vector<RealTimeRenderer::Experiment> experiments;
+    {
+        std::string experiments_base = "experiments/";
+        Directory dir(experiments_base);
+        auto ex_names = dir.getDirectories();
+        std::sort(ex_names.begin(), ex_names.end(), std::greater<std::string>());
+
+        for (auto n : ex_names)
+        {
+            RealTimeRenderer::Experiment e(experiments_base + "/" + n + "/", n, scene->scene_name);
+            if (!e.eps.empty())
+            {
+                experiments.push_back(e);
+            }
+        }
+    }
+    auto ex = experiments[0];
+    auto ep = ex.eps[(experiments.empty()) ? 0 : experiments[0].eps.size() - 1];
+
+    //Params erstellen
+    std::shared_ptr<CombinedParams> params;
+    {
+        params = std::make_shared<CombinedParams>(ex.dir + "/params.ini");
+
+        cudaDeviceProp deviceProp;
+        cudaGetDeviceProperties(&deviceProp, 0);
+        if (deviceProp.major > 6)
+        {
+            std::cout << "Using half_float inference" << std::endl;
+            params->net_params.half_float = true;
+        }
+
+        params->pipeline_params.train             = false;
+        params->render_params.render_outliers     = false;
+        params->train_params.checkpoint_directory = ep.dir;
+
+        params->train_params.loss_vgg = 0;
+        params->train_params.loss_l1  = 0;
+        params->train_params.loss_mse = 0;
+    }
+
+    //TimerSystem erstellen
+    CUDA::CudaTimerSystem timer_system;
+
+    //Pipeline erstellen
+    std::shared_ptr<NeuralPipeline> pipeline;
+    pipeline = std::make_shared<NeuralPipeline>(params);
+    pipeline->Train(false);
+    pipeline->timer_system = &timer_system;
+
+    //NeuralScene erstellen
+    std::shared_ptr<NeuralScene> ns;
+    ns = std::make_shared<NeuralScene>(scene, params);
+    ns->to(torch::kCUDA);
+    ns->Train(0, false);
+
+    //Testdirectory erstellen
     std::filesystem::create_directories("speedMeasurements/");
-    std::string dir = "speedMeasurements/" + scene->scene_name + "/";
-    std::filesystem::create_directories(dir);
+    std::string directory = "speedMeasurements/" + scene->scene_name + "/";
+    std::filesystem::create_directories(directory);
     std::string date = GetCurrentTimeForFileName() + "/";
-    std::filesystem::create_directories(dir + date);
-    double* data = new double[num_cycles * num_timers];
-    double* data_ges = new double[num_cams * num_timers];
+    std::filesystem::create_directories(directory + date);
 
+    //Memory for OutputImage
+    TemplatedImage<vec4> output_image;
+    std::shared_ptr<Saiga::CUDA::Interop> texure_interop;
+    std::shared_ptr<Texture> output_texture;
+
+    //---
+    // Redner and Measure
+    //---
     std::cout << "*Render Scene " << scene_dir << "*" << std::endl;
     Timer timer_ges;
     timer_ges.start();
     for (int i = 0; i < num_cams; i++)
     {
-        //---
-        // Redner and Measure
-        //---
+        // fd erstellen
+        ImageInfo fd;
+        {
+            fd.w              = scene->scene_cameras[0].w * scene->dataset_params.render_scale;
+            fd.h              = scene->scene_cameras[0].h * scene->dataset_params.render_scale;
+            fd.K              = scene->scene_cameras[0].K;
+            fd.distortion     = scene->scene_cameras[0].distortion;
+            fd.ocam           = scene->scene_cameras[0].ocam.cast<float>();
+            fd.crop_transform = fd.crop_transform.scale(scene->dataset_params.render_scale);
+            auto& f           = scene->frames[selected_cam];
+            fd.pose           = Sophus::SE3f::fitToSE3(f.OpenglModel() * GL2CVView()).cast<double>();
+
+            fd.w              = fd.w * render_scale;
+            fd.h              = fd.h * render_scale;
+            fd.K              = fd.K.scale(render_scale);
+            fd.exposure_value = f.exposure_value;
+
+            ns->poses->SetPose(0, fd.pose);
+            ns->intrinsics->SetPinholeIntrinsics(0, fd.K, fd.distortion);
+        }
+
+        // OutputImage erstellen
+        {
+            output_image.create(fd.h, fd.w);
+            output_image.getImageView().set(vec4(1, 1, 1, 1));
+            output_texture = std::make_shared<Texture>(output_image);
+            texure_interop = std::make_shared<Saiga::CUDA::Interop>();
+            texure_interop->initImage(output_texture->getId(), output_texture->getTarget());
+        }
+
+        timer_system.Reset();
         Timer timer_render;
         timer_render.start();
-        renderScene(&neural_renderer, &scene, data);
+        // Rendern
+        torch::Tensor x;
+        {
+            for (int i = 0; i < skip_cycles; i++)
+            {
+                // batch erstellen
+                std::vector<NeuralTrainData> batch(1);
+                {
+                    batch.front()                        = std::make_shared<TorchFrameData>();
+                    batch.front()->img                   = fd;
+                    batch.front()->img.camera_index      = 0;
+                    batch.front()->img.image_index       = 0;
+                    batch.front()->img.camera_model_type = CameraModel::PINHOLE_DISTORTION;
+                    auto uv_image                        = InitialUVImage(fd.h, fd.w);
+                    torch::Tensor uv_tensor;
+                    uv_tensor         = ImageViewToTensor(uv_image.getImageView()).to(torch::kCUDA);
+                    batch.front()->uv = uv_tensor;
+                }
+
+                auto neural_exposure_value = fd.exposure_value - scene->dataset_params.scene_exposure_value;
+                pipeline->Forward(*ns, batch, {}, false, false, neural_exposure_value, fd.white_balance);
+            }
+            for (int i = 0; i < num_cycles; i++)
+            {
+                // batch erstellen
+                std::vector<NeuralTrainData> batch(1);
+                {
+                    batch.front()                        = std::make_shared<TorchFrameData>();
+                    batch.front()->img                   = fd;
+                    batch.front()->img.camera_index      = 0;
+                    batch.front()->img.image_index       = 0;
+                    batch.front()->img.camera_model_type = CameraModel::PINHOLE_DISTORTION;
+                    auto uv_image                        = InitialUVImage(fd.h, fd.w);
+                    torch::Tensor uv_tensor;
+                    uv_tensor         = ImageViewToTensor(uv_image.getImageView()).to(torch::kCUDA);
+                    batch.front()->uv = uv_tensor;
+                }
+
+                auto neural_exposure_value = fd.exposure_value - scene->dataset_params.scene_exposure_value;
+                if (i != num_cycles - 1)
+                {
+                    timer_system.BeginFrame();
+                    pipeline->Forward(*ns, batch, {}, false, false, neural_exposure_value, fd.white_balance);
+                    timer_system.EndFrame();
+                }
+                else
+                {
+                    timer_system.BeginFrame();
+                    auto f_result = pipeline->Forward(*ns, batch, {}, false, false, neural_exposure_value, fd.white_balance);
+                    x = f_result.x;
+                    timer_system.EndFrame();
+                }
+            }
+        }
         timer_render.stop();
         double time_render = timer_render.getTimeMS();
+        
+        // Postprocess for visuialisation
+        {
+            x                           = x.squeeze();
+            torch::Tensor alpha_channel = torch::ones({1, x.size(1), x.size(2)},
+                                                      torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat));
+            x                           = torch::cat({x, alpha_channel}, 0);
+            x                           = x.permute({1, 2, 0});
+            x                           = x.contiguous();
+        }
 
-
-        //---
         // Safe Result
-        //---
-        storeResult(dir + date, time_render, data, &scene, &data_ges[i * num_timers]);
+        {
+            // Download renderImage
+            {
+               
+                std::string path = directory + date + "scene_example_camera" + std::to_string(selected_cam) + ".png";
+                texure_interop->mapImage();
+                cudaMemcpy2DToArray(texure_interop->array, 0, 0, x.data_ptr(), x.stride(0) * sizeof(float),
+                                    x.size(1) * x.size(2) * sizeof(float), x.size(0), cudaMemcpyDeviceToDevice);
+                texure_interop->unmap();
 
-        std::string path = dir + date + "scene_example_camera" + std::to_string(selected_cam) + ".png";
-        auto frame       = neural_renderer->DownloadRender();
-        frame.save(path);
-        if (i == 0)
-        {
-            std::cout << "\nProgress: 00%";
-        }
-        if (int((i+1)*100.0f / num_cams) < 10)
-        {
-            std::cout << "\b\b" << int((i+1)*100.0f / num_cams) << "%";
-        }
-        else
-        {
-            std::cout << "\b\b\b" << int((i+1)*100.0f / num_cams) << "%";
+                TemplatedImage<ucvec4> tmp(output_texture->getHeight(), output_texture->getWidth());
+                output_texture->bind();
+                glGetTexImage(output_texture->getTarget(), 0, GL_RGBA, GL_UNSIGNED_BYTE, tmp.data());
+                assert_no_glerror();
+                output_texture->unbind();
+                tmp.save(path);
+                
+            }
+
+            //Store Result
+            storeResult(directory + date, time_render, &scene, &timer_system);
+
+            //Update Progressbar
+            {
+                if (i == 0)
+                {
+                    std::cout << "\nProgress: 00%";
+                }
+                if (int((i + 1) * 100.0f / num_cams) < 10)
+                {
+                    std::cout << "\b\b" << int((i + 1) * 100.0f / num_cams) << "%";
+                }
+                else
+                {
+                    std::cout << "\b\b\b" << int((i + 1) * 100.0f / num_cams) << "%";
+                }
+            }
         }
 
         selected_cam++;
     }
+    std::cout << "\n";
     timer_ges.stop();
-    double time_ges = timer_ges.getTimeMS();
     if (num_cams > 1)
     {
-        storeResultGes(dir + date, time_ges, data_ges, &scene);
+        double time_ges = timer_ges.getTimeMS();
+        storeResultGes(directory + date, time_ges, &scene);
     }
-    std::cout << "\n\n*Stored result to " << dir + date << "*" << std::endl;
+    else
+    {
+        timer_system.PrintTable(std::cout);
+    }
+    std::cout << "\n\n*Stored result to " << directory + date << "*" << std::endl;
 
     std::cout << std::endl;
     std::cout << "===============" << std::endl;
     std::cout << "*Test Finished*" << std::endl;
     std::cout << "===============" << std::endl;
 }
-
-
