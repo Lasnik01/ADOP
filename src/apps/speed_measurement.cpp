@@ -5,30 +5,15 @@
 #include "opengl/RealTimeRenderer.h"
 #include "saiga/opengl/opengl_helper.h"
 
-const int num_timers = 1;
-const std::string timers_names[num_timers] = {"Frame Time"};
-
-
-std::string scene_dir = "C:/ADOP/ADOPWIN/ADOP/scenes/tt_playground";
+const int max_batch_size = 16;
+std::string scene_dir = "C:/ADOP/MYADOP/ADOP/scenes/tt_playground";
 float render_scale = 1.0f;
-int num_cycles     = 100;
+int num_cycles     = 10;
 int skip_cycles       = 5;
 int selected_cam      = 0;
-int num_cams          = 1;
+int num_cams          = 7;
 bool all_cams         = false;
-
-void initSaiga() {
-    //---
-    // Init Window(only to set SAIGA Paths)
-    // TODO: ggf. inizialisize SAIGA Paths without creating hidden Window
-    //---
-    WindowParameters windowParameters;
-    OpenGLParameters openglParameters;
-    windowParameters.fromConfigFile("config.ini");
-    windowParameters.hidden = true;
-    auto window             = std::make_unique<glfw_Window>(windowParameters, openglParameters);
-    window.release();
-}
+int batch_size         = 2;
 
 std::string GetCurrentTimeForFileName()
 {
@@ -40,31 +25,43 @@ std::string GetCurrentTimeForFileName()
     return s;
 }
 
-void storeResult(std::string path, double time_render, std::shared_ptr<SceneData>* scene, CUDA::CudaTimerSystem* timer_system)
+void storeResult(std::string path, double time_render, std::shared_ptr<SceneData>* scene, CUDA::CudaTimerSystem* timer_system, int batch, int curr_batch_size)
 {
-    std::ofstream file(path + "result_camera" + std::to_string(selected_cam) + ".txt");
-    file << "Speed Measurement"
-         << "\n"
-         << "\n"
-         << "Date: " << GetCurrentTimeForFileName() << "\n"
-         << "Cycles: " << num_cycles << "\n"
-         << "Scene: " << scene->get()->scene_name << "\n"
-         << "Points: " << scene->get()->point_cloud.NumVertices() << "\n"
-         << "Num Images: " << scene->get()->frames.size() << "\n"
-         << "Renderer: " << glGetString(GL_RENDERER) << "\n"
-         << "RenderSize: "
-         << scene->get()->scene_cameras[0].w * scene->get()->dataset_params.render_scale * render_scale << "x"
-         << scene->get()->scene_cameras[0].h * scene->get()->dataset_params.render_scale * render_scale << "\n"
-         << "Test Time: " << time_render << "\n"
-         << "Selected Camera: " << selected_cam << "\n";
-         
-    file << "\n";
-    file << "\n";
-    file << "Result:\n";
-    file << "\n";
-    timer_system->PrintTable(file);
-    file << "\n";
-    file.close();
+    std::ofstream file(path + "result_batch" + std::to_string(batch) + ".txt");
+    if (file.is_open())
+    {
+        file << "Speed Measurement"
+             << "\n"
+             << "\n"
+             << "Date: " << GetCurrentTimeForFileName() << "\n"
+             << "Cycles: " << num_cycles << "\n"
+             << "Scene: " << scene->get()->scene_name << "\n"
+             << "Points: " << scene->get()->point_cloud.NumVertices() << "\n"
+             << "Num Images: " << scene->get()->frames.size() << "\n"
+             << "RenderSize: "
+             << scene->get()->scene_cameras[0].w * scene->get()->dataset_params.render_scale * render_scale << "x"
+             << scene->get()->scene_cameras[0].h * scene->get()->dataset_params.render_scale * render_scale << "\n"
+             << "Test Time: " << time_render << "\n"
+             << "Selected Camera: " << std::to_string(selected_cam + batch * batch_size);
+        if (batch_size > 1)
+        {
+            file << " - " << std::to_string(selected_cam + batch * batch_size + curr_batch_size - 1) << "\n"
+                 << "Batch Size: " << batch_size;
+        }
+        else
+        {
+            file << "\n";
+        }
+
+        file << "\n";
+        file << "\n";
+        file << "\n";
+        file << "Result:\n";
+        file << "\n";
+        timer_system->PrintTable(file);
+        file << "\n";
+        file.close();
+    }
 }
 
 const std::vector<std::string> explode(const std::string& s, const char& c)
@@ -134,12 +131,13 @@ void storeResultGes(std::string path, double time_ges, std::shared_ptr<SceneData
          << "Scene: " << scene->get()->scene_name << "\n"
          << "Points: " << scene->get()->point_cloud.NumVertices() << "\n"
          << "Num Images: " << scene->get()->frames.size() << "\n"
-         << "Renderer: " << glGetString(GL_RENDERER) << "\n"
          << "RenderSize: "
          << scene->get()->scene_cameras[0].w * scene->get()->dataset_params.render_scale * render_scale << "x"
          << scene->get()->scene_cameras[0].h * scene->get()->dataset_params.render_scale * render_scale << "\n"
          << "Test Time: " << time_ges << "\n"
-         << "Num Camera: " << num_cams << "\n";
+         << "Num Cameras: " << num_cams << "\n"
+         << "Batch Size: " << batch_size << "\n";
+    
 
     file << "\n";
     file << "\n";
@@ -181,15 +179,14 @@ int main(int argc, char* argv[])
     app.add_option("--selected_cam", selected_cam, "Camera from witch to render From (0 - NumSceneImages)");
     app.add_option("--num_cams", num_cams, "How many cameras to measure(1 - (NumSceneImages-selected_cam))");
     app.add_option("--all_cams", all_cams, "Measure all available cameras");
+    app.add_option("--batch_size", batch_size, "Number of Images to render Paralell");
     CLI11_PARSE(app, argc, argv);
-
-    initSaiga();
 
     //---
     // Load Scene and Create Renderer
     //---
 
-    // Scene erstellen
+    // Scene erstellen & Argguments checken
     std::shared_ptr<SceneData> scene;
     {
         scene = std::make_shared<SceneData>(scene_dir);
@@ -205,6 +202,10 @@ int main(int argc, char* argv[])
         {
             selected_cam = 0;
             num_cams     = scene->frames.size();
+        }
+        if (batch_size > max_batch_size)
+        {
+            batch_size = max_batch_size;
         }
     }
 
@@ -272,48 +273,43 @@ int main(int argc, char* argv[])
     std::string date = GetCurrentTimeForFileName() + "/";
     std::filesystem::create_directories(directory + date);
 
-    //Memory for OutputImage
-    TemplatedImage<vec4> output_image;
-    std::shared_ptr<Saiga::CUDA::Interop> texure_interop;
-    std::shared_ptr<Texture> output_texture;
-
     //---
     // Redner and Measure
     //---
     std::cout << "*Render Scene " << scene_dir << "*" << std::endl;
+    std::string progressBar = "Progress: 0%";
+    std::cout << "\n" << progressBar;
     Timer timer_ges;
     timer_ges.start();
-    for (int i = 0; i < num_cams; i++)
+    for (int i = 0; i < ceil(float(num_cams)/batch_size); i++)
     {
+        int curr_batch_size = ((i == ceil(float(num_cams) / batch_size) - 1) && (num_cams % batch_size != 0))
+                                  ? (num_cams % batch_size)
+                                  : batch_size;
         // fd erstellen
-        ImageInfo fd;
+        ImageInfo* fd = new ImageInfo[curr_batch_size];
         {
-            fd.w              = scene->scene_cameras[0].w * scene->dataset_params.render_scale;
-            fd.h              = scene->scene_cameras[0].h * scene->dataset_params.render_scale;
-            fd.K              = scene->scene_cameras[0].K;
-            fd.distortion     = scene->scene_cameras[0].distortion;
-            fd.ocam           = scene->scene_cameras[0].ocam.cast<float>();
-            fd.crop_transform = fd.crop_transform.scale(scene->dataset_params.render_scale);
-            auto& f           = scene->frames[selected_cam];
-            fd.pose           = Sophus::SE3f::fitToSE3(f.OpenglModel() * GL2CVView()).cast<double>();
+            for (int j = 0; j < curr_batch_size; j++)
+            {
+                fd[j].w              = scene->scene_cameras[0].w * scene->dataset_params.render_scale;
+                fd[j].h              = scene->scene_cameras[0].h * scene->dataset_params.render_scale;
+                fd[j].K              = scene->scene_cameras[0].K;
+                fd[j].distortion     = scene->scene_cameras[0].distortion;
+                fd[j].ocam           = scene->scene_cameras[0].ocam.cast<float>();
+                fd[j].crop_transform = fd[j].crop_transform.scale(scene->dataset_params.render_scale);
+                auto& f           = scene->frames[selected_cam + batch_size*i + j];
+                fd[j].pose           = Sophus::SE3f::fitToSE3(f.OpenglModel() * GL2CVView()).cast<double>();
 
-            fd.w              = fd.w * render_scale;
-            fd.h              = fd.h * render_scale;
-            fd.K              = fd.K.scale(render_scale);
-            fd.exposure_value = f.exposure_value;
-
-            ns->poses->SetPose(0, fd.pose);
-            ns->intrinsics->SetPinholeIntrinsics(0, fd.K, fd.distortion);
+                fd[j].w              = fd[j].w * render_scale;
+                fd[j].h              = fd[j].h * render_scale;
+                fd[j].K              = fd[j].K.scale(render_scale);
+                fd[j].exposure_value = f.exposure_value;
+                ns->poses->SetPose(j, fd[j].pose);
+                ns->intrinsics->SetPinholeIntrinsics(j, fd[j].K, fd[j].distortion);
+            }
         }
-
-        // OutputImage erstellen
-        {
-            output_image.create(fd.h, fd.w);
-            output_image.getImageView().set(vec4(1, 1, 1, 1));
-            output_texture = std::make_shared<Texture>(output_image);
-            texure_interop = std::make_shared<Saiga::CUDA::Interop>();
-            texure_interop->initImage(output_texture->getId(), output_texture->getTarget());
-        }
+       
+        auto neural_exposure_value = fd[0].exposure_value - scene->dataset_params.scene_exposure_value;
 
         timer_system.Reset();
         Timer timer_render;
@@ -321,52 +317,54 @@ int main(int argc, char* argv[])
         // Rendern
         torch::Tensor x;
         {
-            for (int i = 0; i < skip_cycles; i++)
+            for (int j = 0; j < skip_cycles; j++)
             {
                 // batch erstellen
-                std::vector<NeuralTrainData> batch(1);
+                std::vector<NeuralTrainData> batch(curr_batch_size);
                 {
-                    batch.front()                        = std::make_shared<TorchFrameData>();
-                    batch.front()->img                   = fd;
-                    batch.front()->img.camera_index      = 0;
-                    batch.front()->img.image_index       = 0;
-                    batch.front()->img.camera_model_type = CameraModel::PINHOLE_DISTORTION;
-                    auto uv_image                        = InitialUVImage(fd.h, fd.w);
-                    torch::Tensor uv_tensor;
-                    uv_tensor         = ImageViewToTensor(uv_image.getImageView()).to(torch::kCUDA);
-                    batch.front()->uv = uv_tensor;
+                    for (int k = 0; k < curr_batch_size; k++)
+                    {
+                        batch[k]                        = std::make_shared<TorchFrameData>();
+                        batch[k]->img                        = fd[k];
+                        batch[k]->img.camera_index           = 0;
+                        batch[k]->img.image_index            = 0;
+                        batch[k]->img.camera_model_type      = CameraModel::PINHOLE_DISTORTION;
+                        auto uv_image                        = InitialUVImage(fd[k].h, fd[k].w);
+                        torch::Tensor uv_tensor;
+                        uv_tensor         = ImageViewToTensor(uv_image.getImageView()).to(torch::kCUDA);
+                        batch[k]->uv = uv_tensor;
+                    }
                 }
-
-                auto neural_exposure_value = fd.exposure_value - scene->dataset_params.scene_exposure_value;
-                pipeline->Forward(*ns, batch, {}, false, false, neural_exposure_value, fd.white_balance);
+                pipeline->Forward(*ns, batch, {}, false, false, neural_exposure_value, fd[0].white_balance);
             }
-            for (int i = 0; i < num_cycles; i++)
+            for (int j = 0; j < num_cycles; j++)
             {
                 // batch erstellen
-                std::vector<NeuralTrainData> batch(1);
+                std::vector<NeuralTrainData> batch(curr_batch_size);
                 {
-                    batch.front()                        = std::make_shared<TorchFrameData>();
-                    batch.front()->img                   = fd;
-                    batch.front()->img.camera_index      = 0;
-                    batch.front()->img.image_index       = 0;
-                    batch.front()->img.camera_model_type = CameraModel::PINHOLE_DISTORTION;
-                    auto uv_image                        = InitialUVImage(fd.h, fd.w);
-                    torch::Tensor uv_tensor;
-                    uv_tensor         = ImageViewToTensor(uv_image.getImageView()).to(torch::kCUDA);
-                    batch.front()->uv = uv_tensor;
+                    for (int k = 0; k < curr_batch_size; k++)
+                    {
+                        batch[k]                        = std::make_shared<TorchFrameData>();
+                        batch[k]->img                   = fd[k];
+                        batch[k]->img.camera_index      = 0;
+                        batch[k]->img.image_index       = k;
+                        batch[k]->img.camera_model_type = CameraModel::PINHOLE_DISTORTION;
+                        auto uv_image                   = InitialUVImage(fd[k].h, fd[k].w);
+                        torch::Tensor uv_tensor;
+                        uv_tensor    = ImageViewToTensor(uv_image.getImageView()).to(torch::kCUDA);
+                        batch[k]->uv = uv_tensor;
+                    }
                 }
-
-                auto neural_exposure_value = fd.exposure_value - scene->dataset_params.scene_exposure_value;
-                if (i != num_cycles - 1)
+                if (j != num_cycles - 1)
                 {
                     timer_system.BeginFrame();
-                    pipeline->Forward(*ns, batch, {}, false, false, neural_exposure_value, fd.white_balance);
+                    pipeline->Forward(*ns, batch, {}, false, false, neural_exposure_value, fd[0].white_balance);
                     timer_system.EndFrame();
                 }
                 else
                 {
                     timer_system.BeginFrame();
-                    auto f_result = pipeline->Forward(*ns, batch, {}, false, false, neural_exposure_value, fd.white_balance);
+                    auto f_result = pipeline->Forward(*ns, batch, {}, false, false, neural_exposure_value, fd[0].white_balance);
                     x = f_result.x;
                     timer_system.EndFrame();
                 }
@@ -375,61 +373,43 @@ int main(int argc, char* argv[])
         timer_render.stop();
         double time_render = timer_render.getTimeMS();
         
-        // Postprocess for visuialisation
-        {
-            x                           = x.squeeze();
-            torch::Tensor alpha_channel = torch::ones({1, x.size(1), x.size(2)},
-                                                      torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat));
-            x                           = torch::cat({x, alpha_channel}, 0);
-            x                           = x.permute({1, 2, 0});
-            x                           = x.contiguous();
-        }
-
         // Safe Result
         {
-            // Download renderImage
+            // Store renderImage
             {
+                auto y = x.split(1, 0);
+                for (int j = 0; j < curr_batch_size; j++)
+                {
+                    std::string path = directory + date + "scene_example_camera" +
+                                       std::to_string(selected_cam + batch_size * i + j) + ".png";
+                    Saiga::TensorToImage<ucvec3>(y[j]).save(path);
+                }
                
-                std::string path = directory + date + "scene_example_camera" + std::to_string(selected_cam) + ".png";
-                texure_interop->mapImage();
-                cudaMemcpy2DToArray(texure_interop->array, 0, 0, x.data_ptr(), x.stride(0) * sizeof(float),
-                                    x.size(1) * x.size(2) * sizeof(float), x.size(0), cudaMemcpyDeviceToDevice);
-                texure_interop->unmap();
-
-                TemplatedImage<ucvec4> tmp(output_texture->getHeight(), output_texture->getWidth());
-                output_texture->bind();
-                glGetTexImage(output_texture->getTarget(), 0, GL_RGBA, GL_UNSIGNED_BYTE, tmp.data());
-                assert_no_glerror();
-                output_texture->unbind();
-                tmp.save(path);
-                
             }
 
             //Store Result
-            storeResult(directory + date, time_render, &scene, &timer_system);
-
+            storeResult(directory + date, time_render, &scene, &timer_system, i, curr_batch_size);
+            
             //Update Progressbar
             {
-                if (i == 0)
+                for (size_t i = 0; i < progressBar.size(); i++)
                 {
-                    std::cout << "\nProgress: 00%";
+                    std::cout << "\b";
                 }
-                if (int((i + 1) * 100.0f / num_cams) < 10)
-                {
-                    std::cout << "\b\b" << int((i + 1) * 100.0f / num_cams) << "%";
-                }
-                else
-                {
-                    std::cout << "\b\b\b" << int((i + 1) * 100.0f / num_cams) << "%";
-                }
+                int eta     = (time_render * (ceil(float(num_cams) / batch_size) - i - 1)) / 1000;
+                progressBar =
+                    "Progress: " + std::to_string(int((i + 1) * 100.0f / ceil(float(num_cams) / batch_size))) +
+                              "% (ETA: " + std::to_string(eta / 3600) + "h " + std::to_string((eta % 3600) / 60) +
+                              "min " + std::to_string((eta % 60)) +
+                              "sec)";
+                std::cout << progressBar;
             }
+            
         }
-
-        selected_cam++;
     }
     std::cout << "\n";
     timer_ges.stop();
-    if (num_cams > 1)
+    if (ceil(float(num_cams) / batch_size) > 1)
     {
         double time_ges = timer_ges.getTimeMS();
         storeResultGes(directory + date, time_ges, &scene);
