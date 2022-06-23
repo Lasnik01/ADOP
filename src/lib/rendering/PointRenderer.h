@@ -108,8 +108,8 @@ class PointRendererCache
     void PushParameters(bool forward);
 
     void ProjectPoints(int batch, NeuralPointCloudCuda point_cloud);
-    void DepthPrepassMulti(int batch, NeuralPointCloudCuda point_cloud);
-    void RenderForwardMulti(int batch, NeuralPointCloudCuda point_cloud);
+    void DepthPrepassMulti(int num_batches, NeuralPointCloudCuda point_cloud);
+    void RenderForwardMulti(int num_batches, NeuralPointCloudCuda point_cloud);
     void CombinedForward(int batch, NeuralPointCloudCuda point_cloud);
 
     void RenderBackward(int batch, NeuralPointCloudCuda point_cloud);

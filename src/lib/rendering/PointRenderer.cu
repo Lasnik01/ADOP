@@ -136,6 +136,14 @@ struct DeviceBackwardParams
     StaticDeviceTensor<float, 4> in_gradient_image[max_layers];
 };
 
+constexpr int max_paralell_batches = 16;
+struct CombinedReducedImageInfo
+{
+    ReducedImageInfo cams[max_paralell_batches];
+
+};
+
+
 static __device__ __constant__ DeviceRenderParams d_render_params;
 static __device__ __constant__ DeviceForwardParams d_forward_params;
 static __device__ __constant__ DeviceBackwardParams d_backward_params;
@@ -201,107 +209,113 @@ __device__ T subgroupPartitionedMinNV(T value, cooperative_groups::coalesced_gro
 #endif
 
 template <int num_layers, bool opt_test, bool opt_ballot, bool opt_early_z>
-__global__ void DepthPrepassMulti(DevicePointCloud point_cloud, ReducedImageInfo cam, int batch)
+__global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedImageInfo cams, int num_batches)
 {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
 
     for (int point_id = grid.thread_rank(); point_id < point_cloud.Size(); point_id += grid.size())
     {
-        vec2 ip;
-        float z;
-        float radius_pixels;
+        vec3 position;
+        vec3 normal;
+        float drop_out_radius;
+        thrust::tie(position, normal, drop_out_radius) = point_cloud.GetPoint(point_id);
 
-        if (opt_test)
+        for (int batch = 0; batch < num_batches; batch++)
         {
-            float* dst    = &d_render_params.tmp_projections.Get({batch, point_id, 0});
-            float4 res    = ((float4*)dst)[0];
-            ip(0)         = res.x;
-            ip(1)         = res.y;
-            z             = res.z;
-            radius_pixels = res.w;
+            vec2 ip;
+            float z;
+            float radius_pixels;
 
-            if (z <= 0) continue;
-        }
-        else
-        {
-            vec3 position;
-            vec3 normal;
-            vec2 image_p_a;
-            float drop_out_radius;
-
-            CUDA_KERNEL_ASSERT(cam.image_index >= 0);
-
-            Sophus::SE3f V                                 = d_render_params.Pose(cam.image_index);
-            thrust::tie(position, normal, drop_out_radius) = point_cloud.GetPoint(point_id);
-
-            if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
+            if (opt_test)
             {
-                CUDA_KERNEL_ASSERT(cam.camera_model_type == CameraModel::PINHOLE_DISTORTION);
-                auto [K, distortion]      = d_render_params.PinholeIntrinsics(cam.camera_index);
-                thrust::tie(image_p_a, z) = ProjectPointPinhole(
-                    position, normal, V, K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
-                radius_pixels = K.fx * cam.crop_transform.fx * drop_out_radius / z;
-            }
-            else if (cam.camera_model_type == CameraModel::OCAM)
-            {
-                auto [aff, poly]          = d_render_params.OcamIntrinsics(cam.camera_index);
-                thrust::tie(image_p_a, z) = ProjectPointOcam(position, normal, V, aff, poly,
-                                                             d_render_params.check_normal, d_render_params.dist_cutoff);
+                float* dst    = &d_render_params.tmp_projections.Get({batch, point_id, 0});
+                float4 res    = ((float4*)dst)[0];
+                ip(0)         = res.x;
+                ip(1)         = res.y;
+                z             = res.z;
+                radius_pixels = res.w;
 
-                radius_pixels = d_render_params.depth[0].Image().w * cam.crop_transform.fx * drop_out_radius / z;
-            }
-
-            if (z == 0) continue;
-            ip = cam.crop_transform.normalizedToImage(image_p_a);
-        }
-
-#pragma unroll
-        for (int layer = 0; layer < num_layers; ++layer, radius_pixels *= 0.5f, ip *= 0.5f)
-        {
-            if (d_render_params.drop_out_points_by_radius && radius_pixels < d_render_params.drop_out_radius_threshold)
-            {
-                break;
-            }
-
-            ivec2 p_imgi = ivec2(__float2int_rn(ip(0)), __float2int_rn(ip(1)));
-
-            // Check in image
-            if (!d_render_params.depth[layer].Image().inImage2(p_imgi(1), p_imgi(0))) continue;
-
-
-
-            float* dst_pos = &(d_render_params.depth[layer](batch, 0, p_imgi(1), p_imgi(0)));
-
-            if (opt_early_z)
-            {
-                // earlyz
-                if (z >= *dst_pos) continue;
-            }
-
-            int i_depth = reinterpret_cast<int*>(&z)[0];
-
-#ifdef _CG_HAS_MATCH_COLLECTIVE
-            if constexpr (opt_ballot)
-            {
-                auto ballot   = subgroupPartitionNV(p_imgi);
-                int min_depth = subgroupPartitionedMinNV(i_depth, ballot);
-                if (ballot.thread_rank() == 0)
-                {
-                    atomicMin((int*)dst_pos, min_depth);
-                }
+                if (z <= 0) continue;
             }
             else
+            {
+                vec2 image_p_a;
+
+                ReducedImageInfo cam = cams.cams[batch];
+                CUDA_KERNEL_ASSERT(cam.image_index >= 0);
+                Sophus::SE3f V                                 = d_render_params.Pose(cam.image_index);
+
+                if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
+                {
+                    CUDA_KERNEL_ASSERT(cam.camera_model_type == CameraModel::PINHOLE_DISTORTION);
+                    auto [K, distortion]      = d_render_params.PinholeIntrinsics(cam.camera_index);
+                    thrust::tie(image_p_a, z) = ProjectPointPinhole(
+                        position, normal, V, K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
+                    radius_pixels = K.fx * cam.crop_transform.fx * drop_out_radius / z;
+                }
+                else if (cam.camera_model_type == CameraModel::OCAM)
+                {
+                    auto [aff, poly]          = d_render_params.OcamIntrinsics(cam.camera_index);
+                    thrust::tie(image_p_a, z) = ProjectPointOcam(
+                        position, normal, V, aff, poly, d_render_params.check_normal, d_render_params.dist_cutoff);
+
+                    radius_pixels = d_render_params.depth[0].Image().w * cam.crop_transform.fx * drop_out_radius / z;
+                }
+
+                if (z == 0) continue;
+                ip = cam.crop_transform.normalizedToImage(image_p_a);
+            }
+
+#pragma unroll
+            for (int layer = 0; layer < num_layers; ++layer, radius_pixels *= 0.5f, ip *= 0.5f)
+            {
+                if (d_render_params.drop_out_points_by_radius &&
+                    radius_pixels < d_render_params.drop_out_radius_threshold)
+                {
+                    break;
+                }
+
+                ivec2 p_imgi = ivec2(__float2int_rn(ip(0)), __float2int_rn(ip(1)));
+
+                // Check in image
+                if (!d_render_params.depth[layer].Image().inImage2(p_imgi(1), p_imgi(0))) continue;
+
+
+
+                float* dst_pos = &(d_render_params.depth[layer](batch, 0, p_imgi(1), p_imgi(0)));
+
+                if (opt_early_z)
+                {
+                    // earlyz
+                    if (z >= *dst_pos) continue;
+                }
+
+                int i_depth = reinterpret_cast<int*>(&z)[0];
+
+#ifdef _CG_HAS_MATCH_COLLECTIVE
+                if constexpr (opt_ballot)
+                {
+                    auto ballot   = subgroupPartitionNV(p_imgi);
+                    int min_depth = subgroupPartitionedMinNV(i_depth, ballot);
+                    if (ballot.thread_rank() == 0)
+                    {
+                        atomicMin((int*)dst_pos, min_depth);
+                    }
+                }
+                else
 #endif
 
-            {
-                atomicMin((int*)dst_pos, i_depth);
+                {
+                    atomicMin((int*)dst_pos, i_depth);
+                }
             }
         }
     }
 }
 
+
 template <int num_layers, bool opt_test>
-__global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_p, ReducedImageInfo cam, int batch)
+__global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_p, int dropout_offset, CombinedReducedImageInfo cams, int num_batches)
 {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
 
@@ -311,83 +325,91 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
         //        {
         //            printf("dist cutoff %f\n", d_render_params.dist_cutoff);
         //        }
-        bool drop_out = dropout_p[point_id] == 1;
-        if (drop_out) return;
 
-        vec2 ip;
-        float z;
-        float radius_pixels;
-
-        if (opt_test)
-        {
-            float* dst    = &d_render_params.tmp_projections.Get({batch, point_id, 0});
-            float4 res    = ((float4*)dst)[0];
-            ip(0)         = res.x;
-            ip(1)         = res.y;
-            z             = res.z;
-            radius_pixels = res.w;
-
-            if (z <= 0) continue;
-        }
-        else
-        {
-            vec3 position;
-            vec3 normal;
-            vec2 image_p_a;
-            float drop_out_radius;
-
-            Sophus::SE3f V                                 = d_render_params.Pose(cam.image_index);
-            thrust::tie(position, normal, drop_out_radius) = point_cloud.GetPoint(point_id);
-
-            if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
-            {
-                auto [K, distortion]      = d_render_params.PinholeIntrinsics(cam.camera_index);
-                thrust::tie(image_p_a, z) = ProjectPointPinhole(
-                    position, normal, V, K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
-                radius_pixels = K.fx * cam.crop_transform.fx * drop_out_radius / z;
-            }
-            else if (cam.camera_model_type == CameraModel::OCAM)
-            {
-                auto [aff, poly]          = d_render_params.OcamIntrinsics(cam.camera_index);
-                thrust::tie(image_p_a, z) = ProjectPointOcam(position, normal, V, aff, poly,
-                                                             d_render_params.check_normal, d_render_params.dist_cutoff);
-                radius_pixels = d_render_params.depth[0].Image().w * cam.crop_transform.fx * drop_out_radius / z;
-            }
-
-            if (z == 0) continue;
-            ip = cam.crop_transform.normalizedToImage(image_p_a);
-        }
-
-        int texture_index = point_cloud.GetIndex(point_id);
+        int texture_index                              = point_cloud.GetIndex(point_id);
         CUDA_KERNEL_ASSERT(texture_index >= 0 && texture_index < d_render_params.in_texture.sizes[1]);
 
-#pragma unroll
-        for (int layer = 0; layer < num_layers; ++layer, radius_pixels *= 0.5f, ip *= 0.5f)
-        // for (int layer = num_layers - 1; layer >= 0; --layer, radius_pixels *= 2.f, ip *= 2.f)
+        vec3 position;
+        vec3 normal;
+        float drop_out_radius;
+        thrust::tie(position, normal, drop_out_radius) = point_cloud.GetPoint(point_id);
+
+        for (int batch = 0; batch < num_batches; batch++)
         {
-            if (d_render_params.drop_out_points_by_radius && radius_pixels < d_render_params.drop_out_radius_threshold)
+            bool drop_out = (dropout_p + dropout_offset * batch)[point_id] == 1;
+            if (drop_out) return;                                                                       //todo only one batch fail
+
+            vec2 ip;
+            float z;
+            float radius_pixels;
+
+            if (opt_test)
             {
-                break;
+                float* dst    = &d_render_params.tmp_projections.Get({batch, point_id, 0});
+                float4 res    = ((float4*)dst)[0];
+                ip(0)         = res.x;
+                ip(1)         = res.y;
+                z             = res.z;
+                radius_pixels = res.w;
+
+                if (z <= 0) continue;
+            }
+            else
+            {
+                vec2 image_p_a;
+
+                ReducedImageInfo cam                           = cams.cams[batch];
+                Sophus::SE3f V                                 = d_render_params.Pose(cam.image_index);
+
+                if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
+                {
+                    auto [K, distortion]      = d_render_params.PinholeIntrinsics(cam.camera_index);
+                    thrust::tie(image_p_a, z) = ProjectPointPinhole(
+                        position, normal, V, K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
+                    radius_pixels = K.fx * cam.crop_transform.fx * drop_out_radius / z;
+                }
+                else if (cam.camera_model_type == CameraModel::OCAM)
+                {
+                    auto [aff, poly]          = d_render_params.OcamIntrinsics(cam.camera_index);
+                    thrust::tie(image_p_a, z) = ProjectPointOcam(
+                        position, normal, V, aff, poly, d_render_params.check_normal, d_render_params.dist_cutoff);
+                    radius_pixels = d_render_params.depth[0].Image().w * cam.crop_transform.fx * drop_out_radius / z;
+                }
+
+                if (z == 0) continue;
+                ip = cam.crop_transform.normalizedToImage(image_p_a);
             }
 
-            ivec2 p_imgi = ivec2(__float2int_rn(ip(0)), __float2int_rn(ip(1)));
 
-            // Check in image
-            if (!d_render_params.depth[layer].Image().inImage2(p_imgi(1), p_imgi(0))) continue;
-
-
-            float image_depth = d_render_params.depth[layer](batch, 0, p_imgi(1), p_imgi(0));
-            if (z > image_depth * (d_render_params.depth_accept + 1)) continue;
-
-
-            for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
+#pragma unroll
+            for (int layer = 0; layer < num_layers; ++layer, radius_pixels *= 0.5f, ip *= 0.5f)
+            // for (int layer = num_layers - 1; layer >= 0; --layer, radius_pixels *= 2.f, ip *= 2.f)
             {
-                float t = d_render_params.in_texture(ci, texture_index);
-                atomicAdd(&d_forward_params.neural_out[layer](batch, ci, p_imgi(1), p_imgi(0)), t);
-            }
+                if (d_render_params.drop_out_points_by_radius &&
+                    radius_pixels < d_render_params.drop_out_radius_threshold)
+                {
+                    break;
+                }
 
-            auto* dst_pos_weight = &(d_render_params.weight[layer](batch, 0, p_imgi(1), p_imgi(0)));
-            atomicAdd(dst_pos_weight, 1);
+                ivec2 p_imgi = ivec2(__float2int_rn(ip(0)), __float2int_rn(ip(1)));
+
+                // Check in image
+                if (!d_render_params.depth[layer].Image().inImage2(p_imgi(1), p_imgi(0))) continue;
+
+
+                float image_depth = d_render_params.depth[layer](batch, 0, p_imgi(1), p_imgi(0));
+                if (z > image_depth * (d_render_params.depth_accept + 1)) continue;
+
+
+                for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
+                {
+                    float t = d_render_params.in_texture(ci, texture_index);
+                    atomicAdd(&d_forward_params.neural_out[layer](batch, ci, p_imgi(1), p_imgi(0)), t);
+                }
+
+                auto* dst_pos_weight = &(d_render_params.weight[layer](batch, 0, p_imgi(1), p_imgi(0)));
+                atomicAdd(dst_pos_weight, 1);
+            }
         }
     }
 }
@@ -1163,36 +1185,40 @@ void PointRendererCache::PushParameters(bool forward)
 
 
 
-void PointRendererCache::DepthPrepassMulti(int batch, NeuralPointCloudCuda point_cloud)
+void PointRendererCache::DepthPrepassMulti(int num_batches, NeuralPointCloudCuda point_cloud)
 {
     SAIGA_ASSERT(point_cloud);
 
     {
-        auto cam = info->images[batch];
-        SAIGA_ASSERT(cam.camera_index >= 0 && cam.image_index >= 0);
-
+        CombinedReducedImageInfo cams;
+        for (int i = 0; i < num_batches; i++)
+        {
+            cams.cams[i] = info->images[i];
+            SAIGA_ASSERT(cams.cams[i].camera_index >= 0 && cams.cams[i].image_index >= 0);
+        }
+        
 
         int c = iDivUp(point_cloud->Size(), default_block_size);
 
         if (info->num_layers == 1)
         {
-            ::DepthPrepassMulti<1, false, false, true><<<c, default_block_size>>>(point_cloud, cam, batch);
+            ::DepthPrepassMulti<1, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
         }
         else if (info->num_layers == 2)
         {
-            ::DepthPrepassMulti<2, false, false, true><<<c, default_block_size>>>(point_cloud, cam, batch);
+            ::DepthPrepassMulti<2, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
         }
         else if (info->num_layers == 3)
         {
-            ::DepthPrepassMulti<3, false, false, true><<<c, default_block_size>>>(point_cloud, cam, batch);
+            ::DepthPrepassMulti<3, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
         }
         else if (info->num_layers == 4)
         {
-            ::DepthPrepassMulti<4, false, false, true><<<c, default_block_size>>>(point_cloud, cam, batch);
+            ::DepthPrepassMulti<4, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
         }
         else if (info->num_layers == 5)
         {
-            ::DepthPrepassMulti<5, false, false, true><<<c, default_block_size>>>(point_cloud, cam, batch);
+            ::DepthPrepassMulti<5, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
         }
         else
         {
@@ -1291,40 +1317,41 @@ void PointRendererCache::CombineAndFill(int batch, torch::Tensor background_colo
 }
 
 
-void PointRendererCache::RenderForwardMulti(int batch, NeuralPointCloudCuda point_cloud)
+void PointRendererCache::RenderForwardMulti(int num_batches, NeuralPointCloudCuda point_cloud)
 {
     SAIGA_ASSERT(point_cloud);
-    auto& cam = info->images[batch];
-
     SAIGA_ASSERT(info->scene->texture->texture.is_cuda());
 
+    CombinedReducedImageInfo cams;
+    for (int i = 0; i < num_batches; i++)
+    {
+        cams.cams[i] = info->images[i];
 
-    // std::cout << "render forwrad " << cam.w << "x" << cam.h << " " << cam.camera_index << " " << cam.image_index << "
-    // "
-    //           << cam.crop_transform << std::endl;
+    }
 
     {
-        float* dropout = dropout_points.data_ptr<float>() + dropout_points.stride(0) * batch;
+        float* dropout = dropout_points.data_ptr<float>();
+        int64_t dropout_offset = dropout_points.stride(0);
         int c          = iDivUp(point_cloud->Size(), default_block_size);
         if (info->num_layers == 1)
         {
-            ::RenderForwardMulti<1, false><<<c, default_block_size>>>(point_cloud, dropout, cam, batch);
+            ::RenderForwardMulti<1, false><<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else if (info->num_layers == 2)
         {
-            ::RenderForwardMulti<2, false><<<c, default_block_size>>>(point_cloud, dropout, cam, batch);
+            ::RenderForwardMulti<2, false><<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else if (info->num_layers == 3)
         {
-            ::RenderForwardMulti<3, false><<<c, default_block_size>>>(point_cloud, dropout, cam, batch);
+            ::RenderForwardMulti<3, false> <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else if (info->num_layers == 4)
         {
-            ::RenderForwardMulti<4, false><<<c, default_block_size>>>(point_cloud, dropout, cam, batch);
+            ::RenderForwardMulti<4, false><<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else if (info->num_layers == 5)
         {
-            ::RenderForwardMulti<5, false><<<c, default_block_size>>>(point_cloud, dropout, cam, batch);
+            ::RenderForwardMulti<5, false><<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else
         {
@@ -1411,36 +1438,35 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> BlendPointClou
 
     {
 
-        {SAIGA_OPTIONAL_TIME_MEASURE("DepthPrepass", info->timer_system);
-    for (int b = 0; b < num_batches; ++b)
-    {
-        if (params.render_points)
         {
-            cache.DepthPrepassMulti(b, scene.point_cloud_cuda);
+            SAIGA_OPTIONAL_TIME_MEASURE("DepthPrepass", info->timer_system);
+    
+            if (params.render_points)
+            {
+                cache.DepthPrepassMulti(num_batches, scene.point_cloud_cuda);
+            }
+            if (params.render_outliers)
+            {
+                cache.DepthPrepassMulti(num_batches, scene.outlier_point_cloud_cuda);
+            }
+    
         }
-        if (params.render_outliers)
-        {
-            cache.DepthPrepassMulti(b, scene.outlier_point_cloud_cuda);
-        }
-    }
-}
 
 
-{
-    SAIGA_OPTIONAL_TIME_MEASURE("RenderForward", info->timer_system);
-    for (int b = 0; b < num_batches; ++b)
-    {
-        if (params.render_points)
         {
-            cache.RenderForwardMulti(b, scene.point_cloud_cuda);
-        }
-        if (params.render_outliers)
-        {
-            cache.RenderForwardMulti(b, scene.outlier_point_cloud_cuda);
+            SAIGA_OPTIONAL_TIME_MEASURE("RenderForward", info->timer_system);
+
+            if (params.render_points)
+            {
+                cache.RenderForwardMulti(num_batches, scene.point_cloud_cuda);
+            }
+            if (params.render_outliers)
+            {
+                cache.RenderForwardMulti(num_batches, scene.outlier_point_cloud_cuda);
+            }
+            
         }
     }
-}
-}
 
 
 {

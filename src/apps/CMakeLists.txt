@@ -48,6 +48,9 @@ add_app(preprocess_pointcloud FALSE)
 add_executable(adop_train adop_train.cpp)
 add_app(adop_train TRUE)
 
+add_executable(speed_measurement speed_measurement.cpp speed_measurement.h)
+add_app(speed_measurement FALSE)
+
 if (TARGET saiga_opengl)
     add_executable(adop_viewer adop_viewer.cpp adop_viewer.h)
     add_app(adop_viewer FALSE)
