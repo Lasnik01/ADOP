@@ -140,7 +140,6 @@ constexpr int max_paralell_batches = 16;
 struct CombinedReducedImageInfo
 {
     ReducedImageInfo cams[max_paralell_batches];
-
 };
 
 
@@ -208,7 +207,7 @@ __device__ T subgroupPartitionedMinNV(T value, cooperative_groups::coalesced_gro
 
 #endif
 
-template <int num_layers, bool opt_test, bool opt_ballot, bool opt_early_z>
+template <bool opt_test, bool opt_ballot, bool opt_early_z>
 __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedImageInfo cams, int num_batches)
 {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
@@ -243,7 +242,7 @@ __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedI
 
                 ReducedImageInfo cam = cams.cams[batch];
                 CUDA_KERNEL_ASSERT(cam.image_index >= 0);
-                Sophus::SE3f V                                 = d_render_params.Pose(cam.image_index);
+                Sophus::SE3f V = d_render_params.Pose(cam.image_index);
 
                 if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
                 {
@@ -266,56 +265,85 @@ __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedI
                 ip = cam.crop_transform.normalizedToImage(image_p_a);
             }
 
-#pragma unroll
-            for (int layer = 0; layer < num_layers; ++layer, radius_pixels *= 0.5f, ip *= 0.5f)
+
+            if (d_render_params.drop_out_points_by_radius &&
+                radius_pixels < d_render_params.drop_out_radius_threshold)
             {
-                if (d_render_params.drop_out_points_by_radius &&
-                    radius_pixels < d_render_params.drop_out_radius_threshold)
-                {
-                    break;
-                }
+                continue;
+            }
 
-                ivec2 p_imgi = ivec2(__float2int_rn(ip(0)), __float2int_rn(ip(1)));
+            ivec2 p_imgi = ivec2(__float2int_rn(ip(0)), __float2int_rn(ip(1)));
 
-                // Check in image
-                if (!d_render_params.depth[layer].Image().inImage2(p_imgi(1), p_imgi(0))) continue;
+            // Check in image
+            if (!d_render_params.depth[0].Image().inImage2(p_imgi(1), p_imgi(0))) continue;
 
 
 
-                float* dst_pos = &(d_render_params.depth[layer](batch, 0, p_imgi(1), p_imgi(0)));
+            float* dst_pos = &(d_render_params.depth[0](batch, 0, p_imgi(1), p_imgi(0)));
 
-                if (opt_early_z)
-                {
-                    // earlyz
-                    if (z >= *dst_pos) continue;
-                }
+            if (opt_early_z)
+            {
+                // earlyz
+                if (z >= *dst_pos) continue;
+            }
 
-                int i_depth = reinterpret_cast<int*>(&z)[0];
+            int i_depth = reinterpret_cast<int*>(&z)[0];
 
 #ifdef _CG_HAS_MATCH_COLLECTIVE
-                if constexpr (opt_ballot)
+            if constexpr (opt_ballot)
+            {
+                auto ballot   = subgroupPartitionNV(p_imgi);
+                int min_depth = subgroupPartitionedMinNV(i_depth, ballot);
+                if (ballot.thread_rank() == 0)
                 {
-                    auto ballot   = subgroupPartitionNV(p_imgi);
-                    int min_depth = subgroupPartitionedMinNV(i_depth, ballot);
-                    if (ballot.thread_rank() == 0)
-                    {
-                        atomicMin((int*)dst_pos, min_depth);
-                    }
-                }
-                else
-#endif
-
-                {
-                    atomicMin((int*)dst_pos, i_depth);
+                    atomicMin((int*)dst_pos, min_depth);
                 }
             }
+            else
+#endif
+
+            {
+                atomicMin((int*)dst_pos, i_depth);
+            }
+            
         }
+    }
+}
+
+__global__ void DepthPrepassMipmappingMulti(int width, int height, int layer, int num_batches){
+    int gx = blockIdx.x * blockDim.x + threadIdx.x;
+    int gy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (gx >= width || gy >= height) return;
+
+
+    for (int batch = 0; batch < num_batches; batch++)
+    {
+        float min     = d_render_params.depth[layer - 1](batch, 0, gy * 2, gx * 2);
+        float val1    = d_render_params.depth[layer - 1](batch, 0, gy * 2, gx * 2 + 1);
+        float val2    = d_render_params.depth[layer - 1](batch, 0, gy * 2 + 1, gx * 2);
+        float val3    = d_render_params.depth[layer - 1](batch, 0, gy * 2 + 1, gx * 2 + 1);
+        if (val1 < min)
+        {
+            min = val1;
+        }
+        if (val2 < min)
+        {
+            min = val2;
+        }
+        if (val2 < min)
+        {
+            min = val2;
+        }
+
+        float* dst_pos = &(d_render_params.depth[layer](batch, 0, gy, gx));
+        dst_pos[0]     = min;
     }
 }
 
 
 template <int num_layers, bool opt_test>
-__global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_p, int dropout_offset, CombinedReducedImageInfo cams, int num_batches)
+__global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_p, int dropout_offset,
+                                   CombinedReducedImageInfo cams, int num_batches)
 {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
 
@@ -326,7 +354,7 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
         //            printf("dist cutoff %f\n", d_render_params.dist_cutoff);
         //        }
 
-        int texture_index                              = point_cloud.GetIndex(point_id);
+        int texture_index = point_cloud.GetIndex(point_id);
         CUDA_KERNEL_ASSERT(texture_index >= 0 && texture_index < d_render_params.in_texture.sizes[1]);
 
         vec3 position;
@@ -337,7 +365,7 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
         for (int batch = 0; batch < num_batches; batch++)
         {
             bool drop_out = (dropout_p + dropout_offset * batch)[point_id] == 1;
-            if (drop_out) return;                                                                       //todo only one batch fail
+            if (drop_out) return;  // todo only one batch fail
 
             vec2 ip;
             float z;
@@ -358,8 +386,8 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
             {
                 vec2 image_p_a;
 
-                ReducedImageInfo cam                           = cams.cams[batch];
-                Sophus::SE3f V                                 = d_render_params.Pose(cam.image_index);
+                ReducedImageInfo cam = cams.cams[batch];
+                Sophus::SE3f V       = d_render_params.Pose(cam.image_index);
 
                 if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
                 {
@@ -1024,7 +1052,7 @@ void PointRendererCache::Allocate(NeuralRenderInfo* info, bool forward)
         if (need_allocate_forward || need_allocate_backward)
         {
             l.depth  = torch::empty({num_batches, 1, h, w},
-                                    torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+                                   torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
             l.weight = torch::empty({num_batches, 1, h, w},
                                     torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
         }
@@ -1077,7 +1105,7 @@ void PointRendererCache::InitializeData(bool forward)
             int h                = layers_cuda[i].size(1);
             int texture_channels = info->scene->texture->texture.size(0);
             output_forward[i]    = torch::zeros({num_batches, texture_channels, h, w},
-                                                torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+                                             torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
         }
 
 
@@ -1196,29 +1224,13 @@ void PointRendererCache::DepthPrepassMulti(int num_batches, NeuralPointCloudCuda
             cams.cams[i] = info->images[i];
             SAIGA_ASSERT(cams.cams[i].camera_index >= 0 && cams.cams[i].image_index >= 0);
         }
-        
+
 
         int c = iDivUp(point_cloud->Size(), default_block_size);
 
-        if (info->num_layers == 1)
+        if (info->num_layers >= 1 && info->num_layers <= 5)
         {
-            ::DepthPrepassMulti<1, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
-        }
-        else if (info->num_layers == 2)
-        {
-            ::DepthPrepassMulti<2, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
-        }
-        else if (info->num_layers == 3)
-        {
-            ::DepthPrepassMulti<3, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
-        }
-        else if (info->num_layers == 4)
-        {
-            ::DepthPrepassMulti<4, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
-        }
-        else if (info->num_layers == 5)
-        {
-            ::DepthPrepassMulti<5, false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
+            ::DepthPrepassMulti<false, false, true><<<c, default_block_size>>>(point_cloud, cams, num_batches);
         }
         else
         {
@@ -1226,6 +1238,28 @@ void PointRendererCache::DepthPrepassMulti(int num_batches, NeuralPointCloudCuda
         }
     }
     CUDA_SYNC_CHECK_ERROR();
+}
+
+void PointRendererCache::DepthPrepassMipmappingMulti(int num_batches)
+{
+    {
+        if (info->num_layers < 1 || info->num_layers > 5)
+        {
+            SAIGA_EXIT_ERROR("invalid number of layers");
+        }
+
+        for (int i = 1; i < info->num_layers; ++i)
+        {
+            // Allocate result tensor
+            auto& l = layers_cuda[i];
+            int bx  = iDivUp(l.size.x(), 16);
+            int by  = iDivUp(l.size.y(), 16);
+            SAIGA_ASSERT(bx > 0 && by > 0);
+            ::DepthPrepassMipmappingMulti<<<dim3(bx, by, 1), dim3(16, 16, 1)>>>(l.size.x(), l.size.y(), i, num_batches);
+            CUDA_SYNC_CHECK_ERROR();
+        }
+    }
+   
 }
 
 #if 0
@@ -1326,32 +1360,36 @@ void PointRendererCache::RenderForwardMulti(int num_batches, NeuralPointCloudCud
     for (int i = 0; i < num_batches; i++)
     {
         cams.cams[i] = info->images[i];
-
     }
 
     {
-        float* dropout = dropout_points.data_ptr<float>();
+        float* dropout         = dropout_points.data_ptr<float>();
         int64_t dropout_offset = dropout_points.stride(0);
-        int c          = iDivUp(point_cloud->Size(), default_block_size);
+        int c                  = iDivUp(point_cloud->Size(), default_block_size);
         if (info->num_layers == 1)
         {
-            ::RenderForwardMulti<1, false><<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
+            ::RenderForwardMulti<1, false>
+                <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else if (info->num_layers == 2)
         {
-            ::RenderForwardMulti<2, false><<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
+            ::RenderForwardMulti<2, false>
+                <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else if (info->num_layers == 3)
         {
-            ::RenderForwardMulti<3, false> <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
+            ::RenderForwardMulti<3, false>
+                <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else if (info->num_layers == 4)
         {
-            ::RenderForwardMulti<4, false><<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
+            ::RenderForwardMulti<4, false>
+                <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else if (info->num_layers == 5)
         {
-            ::RenderForwardMulti<5, false><<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
+            ::RenderForwardMulti<5, false>
+                <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else
         {
@@ -1438,35 +1476,36 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> BlendPointClou
 
     {
 
-        {
-            SAIGA_OPTIONAL_TIME_MEASURE("DepthPrepass", info->timer_system);
-    
-            if (params.render_points)
-            {
-                cache.DepthPrepassMulti(num_batches, scene.point_cloud_cuda);
-            }
-            if (params.render_outliers)
-            {
-                cache.DepthPrepassMulti(num_batches, scene.outlier_point_cloud_cuda);
-            }
-    
-        }
+        {SAIGA_OPTIONAL_TIME_MEASURE("DepthPrepass", info->timer_system);
 
-
-        {
-            SAIGA_OPTIONAL_TIME_MEASURE("RenderForward", info->timer_system);
-
-            if (params.render_points)
-            {
-                cache.RenderForwardMulti(num_batches, scene.point_cloud_cuda);
-            }
-            if (params.render_outliers)
-            {
-                cache.RenderForwardMulti(num_batches, scene.outlier_point_cloud_cuda);
-            }
-            
-        }
+    if (params.render_points)
+    {
+        cache.DepthPrepassMulti(num_batches, scene.point_cloud_cuda);
     }
+    if (params.render_outliers)
+    {
+        cache.DepthPrepassMulti(num_batches, scene.outlier_point_cloud_cuda);
+    }
+}
+
+{
+    SAIGA_OPTIONAL_TIME_MEASURE("DepthPrepassMipmapping", info->timer_system);
+    cache.DepthPrepassMipmappingMulti(num_batches);
+}
+
+{
+    SAIGA_OPTIONAL_TIME_MEASURE("RenderForward", info->timer_system);
+
+    if (params.render_points)
+    {
+        cache.RenderForwardMulti(num_batches, scene.point_cloud_cuda);
+    }
+    if (params.render_outliers)
+    {
+        cache.RenderForwardMulti(num_batches, scene.outlier_point_cloud_cuda);
+    }
+}
+}
 
 
 {
@@ -1674,13 +1713,12 @@ __global__ void ApplyTangent(Vec6* tangent, Sophus::SE3d* pose, int n)
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
 
-    //TODO!! 
+    // TODO!!
     Vec6 t = tangent[tid];
     auto p = pose[tid];
 #ifdef _WIN32
     Sophus::SE3d p2(Sophus::se3_expd(t) * p);
-    for (int i = 0; i < 7; ++i)
-        pose[tid].data()[i] = p2.data()[i];
+    for (int i = 0; i < 7; ++i) pose[tid].data()[i] = p2.data()[i];
 #else
     p         = Sophus::se3_expd(t) * p;
     pose[tid] = p;
