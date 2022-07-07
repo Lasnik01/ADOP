@@ -111,6 +111,7 @@ class PointRendererCache
     void DepthPrepassMulti(int num_batches, NeuralPointCloudCuda point_cloud);
     void DepthPrepassMipmappingMulti(int num_batches);
     void RenderForwardMulti(int num_batches, NeuralPointCloudCuda point_cloud);
+    void RenderForwardMipmappingMulti(int num_batches);
     void CombinedForward(int batch, NeuralPointCloudCuda point_cloud);
 
     void RenderBackward(int batch, NeuralPointCloudCuda point_cloud);

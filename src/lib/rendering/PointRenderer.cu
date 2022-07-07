@@ -266,8 +266,7 @@ __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedI
             }
 
 
-            if (d_render_params.drop_out_points_by_radius &&
-                radius_pixels < d_render_params.drop_out_radius_threshold)
+            if (d_render_params.drop_out_points_by_radius && radius_pixels < d_render_params.drop_out_radius_threshold)
             {
                 continue;
             }
@@ -305,12 +304,12 @@ __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedI
             {
                 atomicMin((int*)dst_pos, i_depth);
             }
-            
         }
     }
 }
 
-__global__ void DepthPrepassMipmappingMulti(int width, int height, int layer, int num_batches){
+__global__ void DepthPrepassMipmappingMulti(int width, int height, int layer, int num_batches)
+{
     int gx = blockIdx.x * blockDim.x + threadIdx.x;
     int gy = blockIdx.y * blockDim.y + threadIdx.y;
     if (gx >= width || gy >= height) return;
@@ -318,30 +317,33 @@ __global__ void DepthPrepassMipmappingMulti(int width, int height, int layer, in
 
     for (int batch = 0; batch < num_batches; batch++)
     {
-        float min     = d_render_params.depth[layer - 1](batch, 0, gy * 2, gx * 2);
-        float val1    = d_render_params.depth[layer - 1](batch, 0, gy * 2, gx * 2 + 1);
-        float val2    = d_render_params.depth[layer - 1](batch, 0, gy * 2 + 1, gx * 2);
-        float val3    = d_render_params.depth[layer - 1](batch, 0, gy * 2 + 1, gx * 2 + 1);
+        float res  = 0;
+        float min  = d_render_params.depth[layer - 1](batch, 0, gy * 2, gx * 2);
+        float val1 = d_render_params.depth[layer - 1](batch, 0, gy * 2, gx * 2 + 1);
+        float val2 = d_render_params.depth[layer - 1](batch, 0, gy * 2 + 1, gx * 2);
+        float val3 = d_render_params.depth[layer - 1](batch, 0, gy * 2 + 1, gx * 2 + 1);
         if (val1 < min)
         {
             min = val1;
+            res = 1;
         }
         if (val2 < min)
         {
             min = val2;
+            res = 2;
         }
         if (val2 < min)
         {
-            min = val2;
+            res = 3;
         }
 
         float* dst_pos = &(d_render_params.depth[layer](batch, 0, gy, gx));
-        dst_pos[0]     = min;
+        dst_pos[0]     = res;
     }
 }
 
 
-template <int num_layers, bool opt_test>
+template <bool opt_test>
 __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_p, int dropout_offset,
                                    CombinedReducedImageInfo cams, int num_batches)
 {
@@ -408,37 +410,95 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
                 ip = cam.crop_transform.normalizedToImage(image_p_a);
             }
 
-
-#pragma unroll
-            for (int layer = 0; layer < num_layers; ++layer, radius_pixels *= 0.5f, ip *= 0.5f)
-            // for (int layer = num_layers - 1; layer >= 0; --layer, radius_pixels *= 2.f, ip *= 2.f)
+            if (d_render_params.drop_out_points_by_radius && radius_pixels < d_render_params.drop_out_radius_threshold)
             {
-                if (d_render_params.drop_out_points_by_radius &&
-                    radius_pixels < d_render_params.drop_out_radius_threshold)
-                {
-                    break;
-                }
-
-                ivec2 p_imgi = ivec2(__float2int_rn(ip(0)), __float2int_rn(ip(1)));
-
-                // Check in image
-                if (!d_render_params.depth[layer].Image().inImage2(p_imgi(1), p_imgi(0))) continue;
-
-
-                float image_depth = d_render_params.depth[layer](batch, 0, p_imgi(1), p_imgi(0));
-                if (z > image_depth * (d_render_params.depth_accept + 1)) continue;
-
-
-                for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
-                {
-                    float t = d_render_params.in_texture(ci, texture_index);
-                    atomicAdd(&d_forward_params.neural_out[layer](batch, ci, p_imgi(1), p_imgi(0)), t);
-                }
-
-                auto* dst_pos_weight = &(d_render_params.weight[layer](batch, 0, p_imgi(1), p_imgi(0)));
-                atomicAdd(dst_pos_weight, 1);
+                continue;
             }
+
+            ivec2 p_imgi = ivec2(__float2int_rn(ip(0)), __float2int_rn(ip(1)));
+
+            // Check in image
+            if (!d_render_params.depth[0].Image().inImage2(p_imgi(1), p_imgi(0))) continue;  // layer
+
+
+            float image_depth = d_render_params.depth[0](batch, 0, p_imgi(1), p_imgi(0));  // layer
+            if (z > image_depth * (d_render_params.depth_accept + 1)) continue;
+
+
+            for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
+            {
+                float t = d_render_params.in_texture(ci, texture_index);
+                atomicAdd(&d_forward_params.neural_out[0](batch, ci, p_imgi(1), p_imgi(0)), t);
+            }
+
+            auto* dst_pos_weight = &(d_render_params.weight[0](batch, 0, p_imgi(1), p_imgi(0)));
+            atomicAdd(dst_pos_weight, 1);
         }
+    }
+}
+
+__global__ void RenderForwardMipmappingMulti(int width, int height, int layer, int num_batches)
+{
+    int gx = blockIdx.x * blockDim.x + threadIdx.x;
+    int gy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (gx >= width || gy >= height) return;
+
+
+    for (int batch = 0; batch < num_batches; batch++)
+    {
+        int pix = d_render_params.depth[layer](batch, 0, gy, gx);
+        int x_off = 0;
+        int y_off = 0;
+        switch (pix)
+        {
+            case 0:
+                break;
+            case 1:
+                x_off = 1;     
+                break;
+            case 2:
+                y_off = 1;
+                break;
+            case 3:
+            default:
+                y_off = 1;
+                x_off = 1;     
+                break;
+        }
+        float weight = d_render_params.weight[layer - 1](batch, 0, gy * 2 + y_off, gx * 2 + x_off);
+        if (weight == 0)
+        {   //Sum all pixels
+            for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
+            {
+                float sum_t = d_forward_params.neural_out[layer - 1](batch, ci, gy * 2, gx * 2);
+                sum_t += d_forward_params.neural_out[layer - 1](batch, ci, gy * 2, gx * 2 + 1);
+                sum_t += d_forward_params.neural_out[layer - 1](batch, ci, gy * 2 + 1, gx * 2);
+                sum_t += d_forward_params.neural_out[layer - 1](batch, ci, gy * 2 + 1, gx * 2 + 1);
+
+                float* dst_pos_t = &(d_forward_params.neural_out[layer](batch, ci, gy, gx));
+                dst_pos_t[0]     = sum_t;
+            }
+
+            float sum_weight = d_render_params.weight[layer - 1](batch, 0, gy * 2, gx * 2);
+            sum_weight += d_render_params.weight[layer - 1](batch, 0, gy * 2, gx * 2 + 1);
+            sum_weight += d_render_params.weight[layer - 1](batch, 0, gy * 2 + 1, gx * 2);
+            sum_weight += d_render_params.weight[layer - 1](batch, 0, gy * 2 + 1, gx * 2 + 1);
+
+            float* dst_pos_weight = &(d_render_params.weight[layer](batch, 0, gy, gx));
+            dst_pos_weight[0]     = sum_weight;
+        }
+        else
+        {   //Take closest
+            for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
+            {
+                float* dst_pos_t = &(d_forward_params.neural_out[layer](batch, ci, gy, gx));
+                dst_pos_t[0]     = d_forward_params.neural_out[layer - 1](batch, ci, gy * 2 + y_off, gx * 2 + x_off);
+            }
+
+            float* dst_pos_weight = &(d_render_params.weight[layer](batch, 0, gy, gx));
+            dst_pos_weight[0]     = weight;
+        }
+        
     }
 }
 
@@ -1259,7 +1319,6 @@ void PointRendererCache::DepthPrepassMipmappingMulti(int num_batches)
             CUDA_SYNC_CHECK_ERROR();
         }
     }
-   
 }
 
 #if 0
@@ -1366,29 +1425,9 @@ void PointRendererCache::RenderForwardMulti(int num_batches, NeuralPointCloudCud
         float* dropout         = dropout_points.data_ptr<float>();
         int64_t dropout_offset = dropout_points.stride(0);
         int c                  = iDivUp(point_cloud->Size(), default_block_size);
-        if (info->num_layers == 1)
+        if (info->num_layers >= 1 && info->num_layers <= 5)
         {
-            ::RenderForwardMulti<1, false>
-                <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
-        }
-        else if (info->num_layers == 2)
-        {
-            ::RenderForwardMulti<2, false>
-                <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
-        }
-        else if (info->num_layers == 3)
-        {
-            ::RenderForwardMulti<3, false>
-                <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
-        }
-        else if (info->num_layers == 4)
-        {
-            ::RenderForwardMulti<4, false>
-                <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
-        }
-        else if (info->num_layers == 5)
-        {
-            ::RenderForwardMulti<5, false>
+            ::RenderForwardMulti<false>
                 <<<c, default_block_size>>>(point_cloud, dropout, dropout_offset, cams, num_batches);
         }
         else
@@ -1398,6 +1437,29 @@ void PointRendererCache::RenderForwardMulti(int num_batches, NeuralPointCloudCud
     }
     CUDA_SYNC_CHECK_ERROR();
 }
+
+void PointRendererCache::RenderForwardMipmappingMulti(int num_batches)
+{
+    {
+        if (info->num_layers < 1 || info->num_layers > 5)
+        {
+            SAIGA_EXIT_ERROR("invalid number of layers");
+        }
+
+        for (int i = 1; i < info->num_layers; ++i)
+        {
+            // Allocate result tensor
+            auto& l = layers_cuda[i];
+            int bx  = iDivUp(l.size.x(), 16);
+            int by  = iDivUp(l.size.y(), 16);
+            SAIGA_ASSERT(bx > 0 && by > 0);
+            ::RenderForwardMipmappingMulti<<<dim3(bx, by, 1), dim3(16, 16, 1)>>>(l.size.x(), l.size.y(), i,
+                                                                                 num_batches);
+            CUDA_SYNC_CHECK_ERROR();
+        }
+    }
+}
+
 
 void PointRendererCache::RenderBackward(int batch, NeuralPointCloudCuda point_cloud)
 {
@@ -1504,6 +1566,11 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> BlendPointClou
     {
         cache.RenderForwardMulti(num_batches, scene.outlier_point_cloud_cuda);
     }
+}
+
+{
+    SAIGA_OPTIONAL_TIME_MEASURE("RenderForwardMipmapping", info->timer_system);
+    cache.RenderForwardMipmappingMulti(num_batches);
 }
 }
 
