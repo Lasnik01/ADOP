@@ -42,7 +42,9 @@ __device__ inline vec3 colorizeTurbo(float x)
                 dot(v4, kBlueVec4) + dot(v2, kBlueVec2));
 }
 
-static constexpr int default_block_size = 256;
+static constexpr int default_block_size        = 256;
+static constexpr int default_points_per_thread_depth_prepass = 32;
+static constexpr int default_points_per_thread_render_forward = 16;
 
 struct DeviceRenderParams
 {
@@ -212,6 +214,12 @@ __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedI
 {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
 
+    Sophus::SE3f *V[max_paralell_batches];
+    for (int batch = 0; batch < num_batches; batch++)
+    {
+        CUDA_KERNEL_ASSERT(cams.cams[batch].image_index >= 0);
+        V[batch] = &d_render_params.Pose(cams.cams[batch].image_index);
+    }
     for (int point_id = grid.thread_rank(); point_id < point_cloud.Size(); point_id += grid.size())
     {
         vec3 position;
@@ -239,24 +247,20 @@ __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedI
             else
             {
                 vec2 image_p_a;
-
                 ReducedImageInfo cam = cams.cams[batch];
-                CUDA_KERNEL_ASSERT(cam.image_index >= 0);
-                Sophus::SE3f V = d_render_params.Pose(cam.image_index);
-
                 if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
                 {
                     CUDA_KERNEL_ASSERT(cam.camera_model_type == CameraModel::PINHOLE_DISTORTION);
-                    auto [K, distortion]      = d_render_params.PinholeIntrinsics(cam.camera_index);
+                    auto [K, distortion] = d_render_params.PinholeIntrinsics(cam.camera_index);
                     thrust::tie(image_p_a, z) = ProjectPointPinhole(
-                        position, normal, V, K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
+                        position, normal, *V[batch], K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
                     radius_pixels = K.fx * cam.crop_transform.fx * drop_out_radius / z;
                 }
                 else if (cam.camera_model_type == CameraModel::OCAM)
                 {
-                    auto [aff, poly]          = d_render_params.OcamIntrinsics(cam.camera_index);
+                    auto [aff, poly] = d_render_params.OcamIntrinsics(cam.camera_index);
                     thrust::tie(image_p_a, z) = ProjectPointOcam(
-                        position, normal, V, aff, poly, d_render_params.check_normal, d_render_params.dist_cutoff);
+                        position, normal, *V[batch], aff, poly, d_render_params.check_normal, d_render_params.dist_cutoff);
 
                     radius_pixels = d_render_params.depth[0].Image().w * cam.crop_transform.fx * drop_out_radius / z;
                 }
@@ -308,47 +312,16 @@ __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedI
     }
 }
 
-__global__ void DepthPrepassMipmappingMulti(int width, int height, int layer, int num_batches)
-{
-    int gx = blockIdx.x * blockDim.x + threadIdx.x;
-    int gy = blockIdx.y * blockDim.y + threadIdx.y;
-    if (gx >= width || gy >= height) return;
-
-
-    for (int batch = 0; batch < num_batches; batch++)
-    {
-        float res  = 0;
-        float min  = d_render_params.depth[layer - 1](batch, 0, gy * 2, gx * 2);
-        float val1 = d_render_params.depth[layer - 1](batch, 0, gy * 2, gx * 2 + 1);
-        float val2 = d_render_params.depth[layer - 1](batch, 0, gy * 2 + 1, gx * 2);
-        float val3 = d_render_params.depth[layer - 1](batch, 0, gy * 2 + 1, gx * 2 + 1);
-        if (val1 < min)
-        {
-            min = val1;
-            res = 1;
-        }
-        if (val2 < min)
-        {
-            min = val2;
-            res = 2;
-        }
-        if (val2 < min)
-        {
-            res = 3;
-        }
-
-        float* dst_pos = &(d_render_params.depth[layer](batch, 0, gy, gx));
-        dst_pos[0]     = res;
-    }
-}
-
-
 template <bool opt_test>
 __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_p, int dropout_offset,
                                    CombinedReducedImageInfo cams, int num_batches)
 {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-
+    Sophus::SE3f *V[max_paralell_batches];
+    for (int batch = 0; batch < num_batches; batch++)
+    {
+        V[batch] = &d_render_params.Pose(cams.cams[batch].image_index);
+    }
     for (int point_id = grid.thread_rank(); point_id < point_cloud.Size(); point_id += grid.size())
     {
         //        if (point_id == 0)
@@ -387,22 +360,18 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
             else
             {
                 vec2 image_p_a;
-
                 ReducedImageInfo cam = cams.cams[batch];
-                Sophus::SE3f V       = d_render_params.Pose(cam.image_index);
-
                 if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
                 {
-                    auto [K, distortion]      = d_render_params.PinholeIntrinsics(cam.camera_index);
-                    thrust::tie(image_p_a, z) = ProjectPointPinhole(
-                        position, normal, V, K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
+                    auto [K, distortion] = d_render_params.PinholeIntrinsics(cam.camera_index);
+                    thrust::tie(image_p_a, z) =
+                        ProjectPointPinhole(position, normal, *V[batch], K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
                     radius_pixels = K.fx * cam.crop_transform.fx * drop_out_radius / z;
                 }
                 else if (cam.camera_model_type == CameraModel::OCAM)
                 {
-                    auto [aff, poly]          = d_render_params.OcamIntrinsics(cam.camera_index);
-                    thrust::tie(image_p_a, z) = ProjectPointOcam(
-                        position, normal, V, aff, poly, d_render_params.check_normal, d_render_params.dist_cutoff);
+                    auto [aff, poly] = d_render_params.OcamIntrinsics(cam.camera_index);
+                    thrust::tie(image_p_a, z) = ProjectPointOcam(position, normal, *V[batch], aff, poly, d_render_params.check_normal, d_render_params.dist_cutoff);
                     radius_pixels = d_render_params.depth[0].Image().w * cam.crop_transform.fx * drop_out_radius / z;
                 }
 
@@ -437,68 +406,42 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
     }
 }
 
-__global__ void RenderForwardMipmappingMulti(int width, int height, int layer, int num_batches)
+__global__ void MipmappingMulti(int width, int height, int layer, int num_batches)
 {
     int gx = blockIdx.x * blockDim.x + threadIdx.x;
     int gy = blockIdx.y * blockDim.y + threadIdx.y;
     if (gx >= width || gy >= height) return;
 
-
     for (int batch = 0; batch < num_batches; batch++)
     {
-        int pix = d_render_params.depth[layer](batch, 0, gy, gx);
-        int x_off = 0;
-        int y_off = 0;
-        switch (pix)
+        float depth_vals[4];
+        float min;
+        for (int i = 0; i < 4; i++)
         {
-            case 0:
-                break;
-            case 1:
-                x_off = 1;     
-                break;
-            case 2:
-                y_off = 1;
-                break;
-            case 3:
-            default:
-                y_off = 1;
-                x_off = 1;     
-                break;
-        }
-        float weight = d_render_params.weight[layer - 1](batch, 0, gy * 2 + y_off, gx * 2 + x_off);
-        if (weight == 0)
-        {   //Sum all pixels
-            for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
+            depth_vals[i] = d_render_params.depth[layer - 1](batch, 0, gy * 2 + i / 2, gx * 2 + i % 2);
+            if (i == 0 || depth_vals[i] < min)
             {
-                float sum_t = d_forward_params.neural_out[layer - 1](batch, ci, gy * 2, gx * 2);
-                sum_t += d_forward_params.neural_out[layer - 1](batch, ci, gy * 2, gx * 2 + 1);
-                sum_t += d_forward_params.neural_out[layer - 1](batch, ci, gy * 2 + 1, gx * 2);
-                sum_t += d_forward_params.neural_out[layer - 1](batch, ci, gy * 2 + 1, gx * 2 + 1);
-
-                float* dst_pos_t = &(d_forward_params.neural_out[layer](batch, ci, gy, gx));
-                dst_pos_t[0]     = sum_t;
+                min = depth_vals[i];
             }
-
-            float sum_weight = d_render_params.weight[layer - 1](batch, 0, gy * 2, gx * 2);
-            sum_weight += d_render_params.weight[layer - 1](batch, 0, gy * 2, gx * 2 + 1);
-            sum_weight += d_render_params.weight[layer - 1](batch, 0, gy * 2 + 1, gx * 2);
-            sum_weight += d_render_params.weight[layer - 1](batch, 0, gy * 2 + 1, gx * 2 + 1);
-
-            float* dst_pos_weight = &(d_render_params.weight[layer](batch, 0, gy, gx));
-            dst_pos_weight[0]     = sum_weight;
         }
-        else
-        {   //Take closest
+        float* dst_pos = &(d_render_params.depth[layer](batch, 0, gy, gx));
+        dst_pos[0]     = min;
+
+        for (int i = 0; i < 4; i++)
+        {
+            if (depth_vals[i] > min * (d_render_params.depth_accept + 1))
+            {
+                continue;
+            }
             for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
             {
                 float* dst_pos_t = &(d_forward_params.neural_out[layer](batch, ci, gy, gx));
-                dst_pos_t[0]     = d_forward_params.neural_out[layer - 1](batch, ci, gy * 2 + y_off, gx * 2 + x_off);
+                dst_pos_t[0] += d_forward_params.neural_out[layer - 1](batch, ci, gy * 2 + i / 2, gx * 2 + i % 2);
             }
 
             float* dst_pos_weight = &(d_render_params.weight[layer](batch, 0, gy, gx));
-            dst_pos_weight[0]     = weight;
+            dst_pos_weight[0] += d_render_params.weight[layer - 1](batch, 0, gy * 2 + i / 2, gx * 2 + i % 2);
         }
-        
     }
 }
 
@@ -1276,7 +1219,7 @@ void PointRendererCache::PushParameters(bool forward)
 void PointRendererCache::DepthPrepassMulti(int num_batches, NeuralPointCloudCuda point_cloud)
 {
     SAIGA_ASSERT(point_cloud);
-
+    SAIGA_ASSERT(num_batches <= max_paralell_batches);
     {
         CombinedReducedImageInfo cams;
         for (int i = 0; i < num_batches; i++)
@@ -1286,7 +1229,7 @@ void PointRendererCache::DepthPrepassMulti(int num_batches, NeuralPointCloudCuda
         }
 
 
-        int c = iDivUp(point_cloud->Size(), default_block_size);
+        int c = iDivUp(point_cloud->Size(), default_block_size * default_points_per_thread_depth_prepass);
 
         if (info->num_layers >= 1 && info->num_layers <= 5)
         {
@@ -1298,27 +1241,6 @@ void PointRendererCache::DepthPrepassMulti(int num_batches, NeuralPointCloudCuda
         }
     }
     CUDA_SYNC_CHECK_ERROR();
-}
-
-void PointRendererCache::DepthPrepassMipmappingMulti(int num_batches)
-{
-    {
-        if (info->num_layers < 1 || info->num_layers > 5)
-        {
-            SAIGA_EXIT_ERROR("invalid number of layers");
-        }
-
-        for (int i = 1; i < info->num_layers; ++i)
-        {
-            // Allocate result tensor
-            auto& l = layers_cuda[i];
-            int bx  = iDivUp(l.size.x(), 16);
-            int by  = iDivUp(l.size.y(), 16);
-            SAIGA_ASSERT(bx > 0 && by > 0);
-            ::DepthPrepassMipmappingMulti<<<dim3(bx, by, 1), dim3(16, 16, 1)>>>(l.size.x(), l.size.y(), i, num_batches);
-            CUDA_SYNC_CHECK_ERROR();
-        }
-    }
 }
 
 #if 0
@@ -1424,7 +1346,7 @@ void PointRendererCache::RenderForwardMulti(int num_batches, NeuralPointCloudCud
     {
         float* dropout         = dropout_points.data_ptr<float>();
         int64_t dropout_offset = dropout_points.stride(0);
-        int c                  = iDivUp(point_cloud->Size(), default_block_size);
+        int c                  = iDivUp(point_cloud->Size(), default_block_size * default_points_per_thread_render_forward);
         if (info->num_layers >= 1 && info->num_layers <= 5)
         {
             ::RenderForwardMulti<false>
@@ -1438,7 +1360,7 @@ void PointRendererCache::RenderForwardMulti(int num_batches, NeuralPointCloudCud
     CUDA_SYNC_CHECK_ERROR();
 }
 
-void PointRendererCache::RenderForwardMipmappingMulti(int num_batches)
+void PointRendererCache::MipmappingMulti(int num_batches)
 {
     {
         if (info->num_layers < 1 || info->num_layers > 5)
@@ -1453,8 +1375,7 @@ void PointRendererCache::RenderForwardMipmappingMulti(int num_batches)
             int bx  = iDivUp(l.size.x(), 16);
             int by  = iDivUp(l.size.y(), 16);
             SAIGA_ASSERT(bx > 0 && by > 0);
-            ::RenderForwardMipmappingMulti<<<dim3(bx, by, 1), dim3(16, 16, 1)>>>(l.size.x(), l.size.y(), i,
-                                                                                 num_batches);
+            ::MipmappingMulti<<<dim3(bx, by, 1), dim3(16, 16, 1)>>>(l.size.x(), l.size.y(), i, num_batches);
             CUDA_SYNC_CHECK_ERROR();
         }
     }
@@ -1551,11 +1472,6 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> BlendPointClou
 }
 
 {
-    SAIGA_OPTIONAL_TIME_MEASURE("DepthPrepassMipmapping", info->timer_system);
-    cache.DepthPrepassMipmappingMulti(num_batches);
-}
-
-{
     SAIGA_OPTIONAL_TIME_MEASURE("RenderForward", info->timer_system);
 
     if (params.render_points)
@@ -1569,8 +1485,8 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> BlendPointClou
 }
 
 {
-    SAIGA_OPTIONAL_TIME_MEASURE("RenderForwardMipmapping", info->timer_system);
-    cache.RenderForwardMipmappingMulti(num_batches);
+    SAIGA_OPTIONAL_TIME_MEASURE("Mipmapping", info->timer_system);
+    cache.MipmappingMulti(num_batches);
 }
 }
 
