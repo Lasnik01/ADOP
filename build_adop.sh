@@ -28,5 +28,5 @@ unset CUDA_HOME
 mkdir build
 cd build
 export CONDA=${CONDA_PREFIX:-"$(dirname $(which conda))/../"}
-cmake -DCMAKE_PREFIX_PATH="${CONDA}/lib/python3.9/site-packages/torch/;${CONDA}" ..
-make -j10
+cmake -DCMAKE_PREFIX_PATH="${CONDA}/lib/python3.9/site-packages/torch/;${CONDA}" -DCMAKE_CUDA_COMPILER="/home.local/em89inym/miniconda_install/envs/adop/bin/nvcc" ..
+#make -j10

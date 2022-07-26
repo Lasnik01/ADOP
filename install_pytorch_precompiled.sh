@@ -1,6 +1,6 @@
 #!/bin/bash
 
-CONDA_PATH=~/anaconda3/
+CONDA_PATH=/home.local/em89inym/miniconda_install/
 
 if test -f "$CONDA_PATH/etc/profile.d/conda.sh"; then
     echo "Found Conda at $CONDA_PATH"

@@ -214,12 +214,26 @@ __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedI
 {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
 
-    Sophus::SE3f *V[max_paralell_batches];
-    for (int batch = 0; batch < num_batches; batch++)
+    __shared__ Sophus::SE3f V[max_paralell_batches];
+    __shared__ thrust::pair<IntrinsicsPinholef, Distortionf> pinholeIntrinsics[max_paralell_batches];
+    __shared__ thrust::pair<Vector<float, 5>, ArrayView<const float>> ocamIntrinsics[max_paralell_batches];
+    if(threadIdx.x < num_batches)
     {
-        CUDA_KERNEL_ASSERT(cams.cams[batch].image_index >= 0);
-        V[batch] = &d_render_params.Pose(cams.cams[batch].image_index);
+        CUDA_KERNEL_ASSERT(cams.cams[threadIdx.x].image_index >= 0);
+        V[threadIdx.x] = d_render_params.Pose(cams.cams[threadIdx.x].image_index);
+    }else if(threadIdx.x < num_batches * 2)
+    {
+        if (cams.cams[threadIdx.x%num_batches].camera_model_type == CameraModel::PINHOLE_DISTORTION)
+        {
+            pinholeIntrinsics[threadIdx.x%num_batches] = d_render_params.PinholeIntrinsics(cams.cams[threadIdx.x%num_batches].camera_index);    
+        }
+        else if (cams.cams[threadIdx.x%num_batches].camera_model_type == CameraModel::OCAM)
+        {
+            ocamIntrinsics[threadIdx.x%num_batches] = d_render_params.OcamIntrinsics(cams.cams[threadIdx.x%num_batches].camera_index);
+        }
     }
+    __syncthreads();
+
     for (int point_id = grid.thread_rank(); point_id < point_cloud.Size(); point_id += grid.size())
     {
         vec3 position;
@@ -247,26 +261,20 @@ __global__ void DepthPrepassMulti(DevicePointCloud point_cloud, CombinedReducedI
             else
             {
                 vec2 image_p_a;
-                ReducedImageInfo cam = cams.cams[batch];
-                if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
+                if (cams.cams[batch].camera_model_type == CameraModel::PINHOLE_DISTORTION)
                 {
-                    CUDA_KERNEL_ASSERT(cam.camera_model_type == CameraModel::PINHOLE_DISTORTION);
-                    auto [K, distortion] = d_render_params.PinholeIntrinsics(cam.camera_index);
-                    thrust::tie(image_p_a, z) = ProjectPointPinhole(
-                        position, normal, *V[batch], K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
-                    radius_pixels = K.fx * cam.crop_transform.fx * drop_out_radius / z;
+                    thrust::tie(image_p_a, z) =
+                        ProjectPointPinhole(position, normal, V[batch], pinholeIntrinsics[batch].first, pinholeIntrinsics[batch].second, d_render_params.check_normal, d_render_params.dist_cutoff);
+                    radius_pixels = pinholeIntrinsics[batch].first.fx * cams.cams[batch].crop_transform.fx * drop_out_radius / z;
                 }
-                else if (cam.camera_model_type == CameraModel::OCAM)
+                else if (cams.cams[batch].camera_model_type == CameraModel::OCAM)
                 {
-                    auto [aff, poly] = d_render_params.OcamIntrinsics(cam.camera_index);
-                    thrust::tie(image_p_a, z) = ProjectPointOcam(
-                        position, normal, *V[batch], aff, poly, d_render_params.check_normal, d_render_params.dist_cutoff);
-
-                    radius_pixels = d_render_params.depth[0].Image().w * cam.crop_transform.fx * drop_out_radius / z;
+                    thrust::tie(image_p_a, z) = ProjectPointOcam(position, normal, V[batch], ocamIntrinsics[batch].first, ocamIntrinsics[batch].second, d_render_params.check_normal, d_render_params.dist_cutoff);
+                    radius_pixels = d_render_params.depth[0].Image().w * cams.cams[batch].crop_transform.fx * drop_out_radius / z;
                 }
 
                 if (z == 0) continue;
-                ip = cam.crop_transform.normalizedToImage(image_p_a);
+                ip = cams.cams[batch].crop_transform.normalizedToImage(image_p_a);
             }
 
 
@@ -317,11 +325,27 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
                                    CombinedReducedImageInfo cams, int num_batches)
 {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-    Sophus::SE3f *V[max_paralell_batches];
-    for (int batch = 0; batch < num_batches; batch++)
+
+    __shared__ Sophus::SE3f V[max_paralell_batches];
+    __shared__ thrust::pair<IntrinsicsPinholef, Distortionf> pinholeIntrinsics[max_paralell_batches];
+    __shared__ thrust::pair<Vector<float, 5>, ArrayView<const float>> ocamIntrinsics[max_paralell_batches];
+    if(threadIdx.x < num_batches)
     {
-        V[batch] = &d_render_params.Pose(cams.cams[batch].image_index);
+        CUDA_KERNEL_ASSERT(cams.cams[threadIdx.x].image_index >= 0);
+        V[threadIdx.x] = d_render_params.Pose(cams.cams[threadIdx.x].image_index);
+    }else if(threadIdx.x < num_batches * 2)
+    {
+        if (cams.cams[threadIdx.x%num_batches].camera_model_type == CameraModel::PINHOLE_DISTORTION)
+        {
+            pinholeIntrinsics[threadIdx.x%num_batches] = d_render_params.PinholeIntrinsics(cams.cams[threadIdx.x%num_batches].camera_index);    
+        }
+        else if (cams.cams[threadIdx.x%num_batches].camera_model_type == CameraModel::OCAM)
+        {
+            ocamIntrinsics[threadIdx.x%num_batches] = d_render_params.OcamIntrinsics(cams.cams[threadIdx.x%num_batches].camera_index);
+        }
     }
+    __syncthreads();
+    
     for (int point_id = grid.thread_rank(); point_id < point_cloud.Size(); point_id += grid.size())
     {
         //        if (point_id == 0)
@@ -360,23 +384,20 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
             else
             {
                 vec2 image_p_a;
-                ReducedImageInfo cam = cams.cams[batch];
-                if (cam.camera_model_type == CameraModel::PINHOLE_DISTORTION)
+                if (cams.cams[batch].camera_model_type == CameraModel::PINHOLE_DISTORTION)
                 {
-                    auto [K, distortion] = d_render_params.PinholeIntrinsics(cam.camera_index);
                     thrust::tie(image_p_a, z) =
-                        ProjectPointPinhole(position, normal, *V[batch], K, distortion, d_render_params.check_normal, d_render_params.dist_cutoff);
-                    radius_pixels = K.fx * cam.crop_transform.fx * drop_out_radius / z;
+                        ProjectPointPinhole(position, normal, V[batch], pinholeIntrinsics[batch].first, pinholeIntrinsics[batch].second, d_render_params.check_normal, d_render_params.dist_cutoff);
+                    radius_pixels = pinholeIntrinsics[batch].first.fx * cams.cams[batch].crop_transform.fx * drop_out_radius / z;
                 }
-                else if (cam.camera_model_type == CameraModel::OCAM)
+                else if (cams.cams[batch].camera_model_type == CameraModel::OCAM)
                 {
-                    auto [aff, poly] = d_render_params.OcamIntrinsics(cam.camera_index);
-                    thrust::tie(image_p_a, z) = ProjectPointOcam(position, normal, *V[batch], aff, poly, d_render_params.check_normal, d_render_params.dist_cutoff);
-                    radius_pixels = d_render_params.depth[0].Image().w * cam.crop_transform.fx * drop_out_radius / z;
+                    thrust::tie(image_p_a, z) = ProjectPointOcam(position, normal, V[batch], ocamIntrinsics[batch].first, ocamIntrinsics[batch].second, d_render_params.check_normal, d_render_params.dist_cutoff);
+                    radius_pixels = d_render_params.depth[0].Image().w * cams.cams[batch].crop_transform.fx * drop_out_radius / z;
                 }
 
                 if (z == 0) continue;
-                ip = cam.crop_transform.normalizedToImage(image_p_a);
+                ip = cams.cams[batch].crop_transform.normalizedToImage(image_p_a);
             }
 
             if (d_render_params.drop_out_points_by_radius && radius_pixels < d_render_params.drop_out_radius_threshold)
@@ -387,10 +408,10 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
             ivec2 p_imgi = ivec2(__float2int_rn(ip(0)), __float2int_rn(ip(1)));
 
             // Check in image
-            if (!d_render_params.depth[0].Image().inImage2(p_imgi(1), p_imgi(0))) continue;  // layer
+            if (!d_render_params.depth[0].Image().inImage2(p_imgi(1), p_imgi(0))) continue; 
 
 
-            float image_depth = d_render_params.depth[0](batch, 0, p_imgi(1), p_imgi(0));  // layer
+            float image_depth = d_render_params.depth[0](batch, 0, p_imgi(1), p_imgi(0));
             if (z > image_depth * (d_render_params.depth_accept + 1)) continue;
 
 

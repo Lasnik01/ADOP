@@ -34,6 +34,10 @@ if (ADOP_ASAN)
     target_link_options(${TARGET_NAME} PUBLIC -fsanitize=address)
 endif ()
 
+target_compile_options(
+            ${TARGET_NAME} PUBLIC
+            $<$<COMPILE_LANGUAGE:CUDA>: -lineinfo>
+    )
 list(APPEND MY_CUDA_FLAGS "--expt-relaxed-constexpr")
 list(APPEND MY_CUDA_FLAGS "-lineinfo")
 
@@ -51,7 +55,6 @@ FILE(GLOB_RECURSE RENDER_SRC rendering/*.cpp)
 FILE(GLOB_RECURSE RENDER_CUDA_SRC rendering/*.cu)
 FILE(GLOB_RECURSE PROG_HEADER *.h ${SAIGA_BUILDCONFIG_FILE})
 target_sources(${TARGET_NAME} PRIVATE ${DATA_SRC} ${MODELS_SRC} ${OPENGL_SRC} ${RENDER_SRC} ${RENDER_CUDA_SRC} PUBLIC ${PROG_HEADER})
-
 
 set_target_properties(${TARGET_NAME} PROPERTIES CXX_STANDARD 17)
 set_target_properties(${TARGET_NAME} PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
