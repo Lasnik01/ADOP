@@ -49,18 +49,16 @@ struct OutputImages
 HD inline thrust::pair<vec2, float> ProjectPointPinhole(vec3 p, vec3 n, Sophus::SE3f V, IntrinsicsPinholef K,
                                                         Distortionf distortion, bool check_normal, float dist_cutoff)
 {
-    vec3 world_p = vec3(p(0), p(1), p(2));
+    
 
-
-    vec3 view_p = TransformPoint<float>(V, world_p);
+    vec3 view_p = TransformPoint<float>(V, p);
     float z     = view_p.z();
     z           = fmax(z, 0.f);
 
     if (check_normal)
     {
         CUDA_KERNEL_ASSERT(isfinite(n(0)) & isfinite(n(1)) & isfinite(n(2)));
-        vec3 world_n = vec3(n(0), n(1), n(2));
-        vec3 view_n  = V.so3() * world_n;
+        vec3 view_n  = V.so3() * n;
         if (dot(view_p, view_n) > 0)
         {
             z = 0;
@@ -87,16 +85,13 @@ HD inline thrust::pair<vec2, float> ProjectPointOcam(vec3 p, vec3 n, Sophus::SE3
 {
     CUDA_KERNEL_ASSERT(isfinite(n(0)) & isfinite(n(1)) & isfinite(n(2)));
 
-    vec3 world_p = vec3(p(0), p(1), p(2));
-    vec3 world_n = vec3(n(0), n(1), n(2));
-
-    vec3 view_p = TransformPoint<float>(V, world_p);
+    vec3 view_p = TransformPoint<float>(V, p);
 
     vec3 ip_z    = ProjectOCam(view_p, a, poly, dist_cutoff);
     vec2 image_p = ip_z.head<2>();
     float z      = ip_z(2);
 
-    vec3 view_n = V.so3() * world_n;
+    vec3 view_n = V.so3() * n;
     if (check_normal & dot(view_p, view_n) > 0)
     {
         z = 0;

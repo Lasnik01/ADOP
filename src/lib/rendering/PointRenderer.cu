@@ -43,7 +43,7 @@ __device__ inline vec3 colorizeTurbo(float x)
 }
 
 static constexpr int default_block_size        = 256;
-static constexpr int default_points_per_thread_depth_prepass = 32;
+static constexpr int default_points_per_thread_depth_prepass = 8;
 static constexpr int default_points_per_thread_render_forward = 16;
 
 struct DeviceRenderParams
@@ -364,7 +364,7 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
         for (int batch = 0; batch < num_batches; batch++)
         {
             bool drop_out = (dropout_p + dropout_offset * batch)[point_id] == 1;
-            if (drop_out) return;  // todo only one batch fail
+            if (drop_out) continue; 
 
             vec2 ip;
             float z;
@@ -433,36 +433,84 @@ __global__ void MipmappingMulti(int width, int height, int layer, int num_batche
     int gy = blockIdx.y * blockDim.y + threadIdx.y;
     if (gx >= width || gy >= height) return;
 
+    float min;
+    __shared__ float min_vals[16][16];
+    int lx = gx%16;
+    int ly = gy%16;
+
     for (int batch = 0; batch < num_batches; batch++)
     {
-        float depth_vals[4];
-        float min;
-        for (int i = 0; i < 4; i++)
         {
-            depth_vals[i] = d_render_params.depth[layer - 1](batch, 0, gy * 2 + i / 2, gx * 2 + i % 2);
-            if (i == 0 || depth_vals[i] < min)
+            float depth_vals[4];
+            for (int i = 0; i < 4; i++)
             {
-                min = depth_vals[i];
+                depth_vals[i] = d_render_params.depth[0](batch, 0, gy * 2 + i / 2, gx * 2 + i % 2);
+                if (i == 0 || depth_vals[i] < min)
+                {
+                    min = depth_vals[i];
+                }
             }
-        }
-        float* dst_pos = &(d_render_params.depth[layer](batch, 0, gy, gx));
-        dst_pos[0]     = min;
+            float* dst_pos = &(d_render_params.depth[1](batch, 0, gy, gx));
+            dst_pos[0]     = min;
 
-        for (int i = 0; i < 4; i++)
+            for (int i = 0; i < 4; i++)
+            {
+                if (depth_vals[i] > min * (d_render_params.depth_accept + 1))
+                {
+                    continue;
+                }
+                for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
+                {
+                    float* dst_pos_t = &(d_forward_params.neural_out[1](batch, ci, gy, gx));
+                    dst_pos_t[0] += d_forward_params.neural_out[0](batch, ci, gy * 2 + i / 2, gx * 2 + i % 2);
+                }
+
+                float* dst_pos_weight = &(d_render_params.weight[1](batch, 0, gy, gx));
+                dst_pos_weight[0] += d_render_params.weight[0](batch, 0, gy * 2 + i / 2, gx * 2 + i % 2);
+            }
+            min_vals[ly][lx] = min;
+            __syncthreads();
+        }
         {
-            if (depth_vals[i] > min * (d_render_params.depth_accept + 1))
-            {
-                continue;
-            }
-            for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
-            {
-                float* dst_pos_t = &(d_forward_params.neural_out[layer](batch, ci, gy, gx));
-                dst_pos_t[0] += d_forward_params.neural_out[layer - 1](batch, ci, gy * 2 + i / 2, gx * 2 + i % 2);
-            }
+            int offset = 2;
+            for(int l = 2; l < layer; l++){
+                if(gy % offset == 0 && gx % offset == 0){
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if (i == 0 || min_vals[ly + (i / 2) * offset/2][ lx + (i % 2) * offset/2] < min)
+                        {
+                            min = min_vals[ly + (i / 2) * offset/2][lx + (i % 2) * offset/2];
+                        }
+                    }
+                    float* dst_pos = &(d_render_params.depth[l](batch, 0, gy  / offset, gx / offset));
+                    dst_pos[0]     = min;
 
-            float* dst_pos_weight = &(d_render_params.weight[layer](batch, 0, gy, gx));
-            dst_pos_weight[0] += d_render_params.weight[layer - 1](batch, 0, gy * 2 + i / 2, gx * 2 + i % 2);
-        }
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if (min_vals[ly + (i / 2) * offset/2][lx + (i % 2) * offset/2] > min * (d_render_params.depth_accept + 1))
+                        {
+                            continue;
+                        }
+                        int dst_x =  gx / offset;
+                        int dst_y =  gy / offset;
+                        int src_x = dst_x * 2 + i%2;
+                        int src_y = dst_y * 2 + i/2;
+                        for (int ci = 0; ci < d_render_params.in_texture.sizes[0]; ++ci)
+                        {
+                            float* dst_pos_t = &(d_forward_params.neural_out[l](batch, ci, dst_y, dst_x));
+                            dst_pos_t[0] += d_forward_params.neural_out[l-1](batch, ci, src_y, src_x);
+                        }
+
+                        float* dst_pos_weight = &(d_render_params.weight[l](batch, 0, dst_y, dst_x));
+                        dst_pos_weight[0] += d_render_params.weight[l-1](batch, 0, src_y, src_x);
+                    }
+                    min_vals[ly][lx] = min;
+                    offset *= 2;
+                }
+                __syncthreads();
+            }
+        }   
+
     }
 }
 
@@ -1383,22 +1431,18 @@ void PointRendererCache::RenderForwardMulti(int num_batches, NeuralPointCloudCud
 
 void PointRendererCache::MipmappingMulti(int num_batches)
 {
+    if (info->num_layers < 1 || info->num_layers > 5)
     {
-        if (info->num_layers < 1 || info->num_layers > 5)
-        {
-            SAIGA_EXIT_ERROR("invalid number of layers");
-        }
-
-        for (int i = 1; i < info->num_layers; ++i)
-        {
-            // Allocate result tensor
-            auto& l = layers_cuda[i];
-            int bx  = iDivUp(l.size.x(), 16);
-            int by  = iDivUp(l.size.y(), 16);
-            SAIGA_ASSERT(bx > 0 && by > 0);
-            ::MipmappingMulti<<<dim3(bx, by, 1), dim3(16, 16, 1)>>>(l.size.x(), l.size.y(), i, num_batches);
-            CUDA_SYNC_CHECK_ERROR();
-        }
+        SAIGA_EXIT_ERROR("invalid number of layers");
+    }
+    if(info->num_layers > 1){
+        // Allocate result tensor
+        auto& l = layers_cuda[1];
+        int bx  = iDivUp(l.size.x(), 16);
+        int by  = iDivUp(l.size.y(), 16);
+        SAIGA_ASSERT(bx > 0 && by > 0);
+        ::MipmappingMulti<<<dim3(bx, by, 1), dim3(16, 16, 1)>>>(l.size.x(), l.size.y(), info->num_layers, num_batches);
+        CUDA_SYNC_CHECK_ERROR();
     }
 }
 

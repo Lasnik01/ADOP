@@ -212,11 +212,11 @@ ForwardResult NeuralPipeline::Forward(NeuralScene& scene, std::vector<NeuralTrai
 
         if (params->render_params.output_background_mask)
         {
-            x = render_network->forward(neural_images, masks);
+            x = render_network->forward(neural_images, masks, timer_system);
         }
         else
         {
-            x = render_network->forward(neural_images);
+            x = render_network->forward(neural_images, timer_system);
         }
         SAIGA_ASSERT(x.size(1) == params->net_params.num_output_channels);
         SAIGA_ASSERT(x.size(1) == 3);
