@@ -281,6 +281,7 @@ void SpeedMeasurement::storeResult( double time_render, int batch, int curr_batc
         timer_system.PrintTable(file);
         file << "\n";
         file.close();
+
     }
 }
 

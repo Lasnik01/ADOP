@@ -36,7 +36,7 @@ endif ()
 
 target_compile_options(
             ${TARGET_NAME} PUBLIC
-            $<$<COMPILE_LANGUAGE:CUDA>: -lineinfo -maxrregcount=80 >
+            $<$<COMPILE_LANGUAGE:CUDA>: -lineinfo >
     )
 list(APPEND MY_CUDA_FLAGS "--expt-relaxed-constexpr")
 list(APPEND MY_CUDA_FLAGS "-lineinfo")

@@ -14,13 +14,13 @@ class SpeedMeasurement
 
     //Default Test Parameters
     std::string scene_dir = "scenes/tt_playground";
-    float render_scale    = 0.5f;
-    int num_cycles        = 100;
+    float render_scale    = 1;
+    int num_cycles        = 20;
     int skip_cycles       = 5;
     int selected_cam      = 0;
-    int num_cams          = 16;
+    int num_cams          = 1;
     bool all_cams         = false;
-    int batch_size        = 4;
+    int batch_size        = 1;
 
     private:
     std::shared_ptr<SceneData> scene;
