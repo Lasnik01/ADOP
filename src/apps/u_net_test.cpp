@@ -1,13 +1,13 @@
 #include "u_net_test.h"
-
+#include "saiga/cuda/CudaInfo.h"
 const int in_channels = 32;
-const int out_channels = 60;
+const int out_channels = 16;
 const int kernel_size = 3;
 const int stride = 1;
 const int dilation = 1;
 const int n_pad_pxl = 1;
-const int width = 480;
-const int height = 270;
+const int width = 1920;
+const int height = 1080;
 
 const int num_cycles = 100;
 
@@ -156,6 +156,8 @@ void UNetTest::runTest()
 
 int main(int argc, char* argv[])
 {
+    //CUDA::printCUDAInfo();
     UNetTest test;
+
     test.runTest();
 }

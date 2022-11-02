@@ -29,14 +29,14 @@ target_link_libraries(${TARGET_NAME} ${LIBS})
 if (ADOP_ASAN)
     target_compile_options(
             ${TARGET_NAME} PUBLIC
-            $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address>
+            $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address  -maxrregcount=80>
     )
     target_link_options(${TARGET_NAME} PUBLIC -fsanitize=address)
 endif ()
 
 target_compile_options(
             ${TARGET_NAME} PUBLIC
-            $<$<COMPILE_LANGUAGE:CUDA>: -lineinfo >
+            $<$<COMPILE_LANGUAGE:CUDA>: -lineinfo>
     )
 list(APPEND MY_CUDA_FLAGS "--expt-relaxed-constexpr")
 list(APPEND MY_CUDA_FLAGS "-lineinfo")

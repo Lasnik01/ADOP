@@ -29,6 +29,7 @@ class MyConvUnet2d
     void ForwardMulti1(const torch::Tensor data_in);
     void ForwardMulti2(const torch::Tensor data_in);
     void ForwardMulti3(const torch::Tensor data_in);
+    void ForwardMulti4(const torch::Tensor data_in);
     torch::Tensor Forward(const torch::Tensor data_in);
 
 
@@ -52,4 +53,7 @@ class MyConvUnet2d
 
     torch::Tensor weight3;
     torch::Tensor bias3;
+
+    torch::Tensor weight4;
+    torch::Tensor bias4;
 };

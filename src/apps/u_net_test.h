@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/Pipeline.h"
+#include "rendering/MyConvUnet2d.h"
 
 class UNetTest
 {

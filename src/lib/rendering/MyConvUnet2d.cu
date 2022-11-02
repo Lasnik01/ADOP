@@ -298,6 +298,7 @@ __global__ void Postprocess2(StaticDeviceTensor<float, 4> in, StaticDeviceTensor
 
 
 
+
 __global__ void PreprocessParameters3(StaticDeviceTensor<float, 4> out_weight, StaticDeviceTensor<float, 1> out_bias,
                                       StaticDeviceTensor<__half, 4> forward_weight,StaticDeviceTensor<__half, 4> mask_weight,
                                       StaticDeviceTensor<__half, 1> forward_bias, StaticDeviceTensor<__half, 1> mask_bias)
@@ -320,8 +321,153 @@ __global__ void PreprocessParameters3(StaticDeviceTensor<float, 4> out_weight, S
     }
 }
 
+template <int pixperwarp, int out_channels>
+__global__ void Forward3(StaticDeviceTensor<__half, 4> in, StaticDeviceTensor<float, 4> out, int num_batches, int width, int height , StaticDeviceTensor<float, 4> in_weight)
+{
+    int gx = blockIdx.x * pixperwarp;
+    const int gy = blockIdx.y * blockDim.y + threadIdx.y;
+    const int in_layer = threadIdx.x;
+    if (gx >= width || gy >= height)
+    {
+        return;
+    }
+
+    for (int batch = 0; batch < num_batches; batch++)
+    {
+        for (int x_offset = 0; x_offset < pixperwarp; x_offset++)
+        {
+            if(gx >= width){
+                break;
+            }
+            __half2 sum[out_channels];
+            for (int out_layer = 0; out_layer < out_channels; out_layer++)
+            {
+                sum[out_layer].x = 0;
+                sum[out_layer].y = 0;
+            }
+            if (gx == 0 || gy == 0 || gx == width - 1 || gy == height - 1)
+            {
+                for (int dx = 0; dx < kernel_size; dx++)
+                {
+                    int lx = gx - 1 + dx;
+                    for (int dy = 0; dy < kernel_size; dy++)
+                    {
+                        int ly = gy - 1 + dy;
+                        if (lx >= 0 && ly >= 0 && lx < width && ly < height)
+                        {
+                            __half value = in(batch, lx, ly, in_layer);
+                            for (int out_layer = 0; out_layer < out_channels; out_layer++)
+                            {
+                                __half2 weights = reinterpret_cast<__half2*>(&in_weight(dx, dy,out_layer, in_layer))[0];       //ggf aus constmemory langsamer
+                                sum[out_layer].x += (weights.x * value);
+                                sum[out_layer].y += (weights.y * value);
+                            }
+                        }
+                    }
+                }
+                for (int out_layer = 0; out_layer < out_channels; out_layer++)
+                {
+                    sum[out_layer] = Saiga::CUDA::warpReduceSum<__half2, 32, false, int>(sum[out_layer]);
+                    if (threadIdx.x == 0)
+                    {
+                        reinterpret_cast<__half2*>(&out(batch, out_layer, gy, gx))[0] = sum[out_layer];     //ggf 2 durchläufe und addieren
+                    }
+                }
+            }
+            else
+            {
+                for (int dx = 0; dx < kernel_size; dx++)
+                {
+                    int lx = gx - 1 + dx;
+                    for (int dy = 0; dy < kernel_size; dy++)
+                    {
+                        int ly       = gy - 1 + dy;
+                        __half value = in(batch, lx, ly, in_layer);
+                        for (int out_layer = 0; out_layer < out_channels; out_layer++)
+                        {
+                            __half2 weights = reinterpret_cast<__half2*>(&in_weight(dx, dy, out_layer, in_layer))[0];       //ggf aus constmemory
+                            sum[out_layer].x += (weights.x * value);
+                            sum[out_layer].y += (weights.y * value);
+                        }
+                    }
+                }
+                for (int out_layer = 0; out_layer < out_channels; out_layer++)
+                {
+                    sum[out_layer] = Saiga::CUDA::warpReduceSum<__half2, 32, false, int>(sum[out_layer]);
+                    if (threadIdx.x == 0)
+                    {
+                        reinterpret_cast<__half2*>(&out(batch, out_layer, gy, gx))[0] = sum[out_layer];     //ggf 2 durchläufe und addieren
+                    }
+                }
+            }
+            gx++;
+        }
+        gx = blockIdx.x * pixperwarp;
+    }
+}
+
+
+template <bool use_elu>
+__global__ void Postprocess3(StaticDeviceTensor<float, 4> in, StaticDeviceTensor<__half, 4> out, int num_batches, int width, int height, StaticDeviceTensor<float, 1> in_bias)
+{
+    const int gx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (gx >= width || gy >= height)
+    {
+        return;
+    }
+
+    int out_layer = blockIdx.z;
+    half2 bias    = reinterpret_cast<__half2*>(&in_bias(out_layer))[0];
+
+    for (int batch = 0; batch < num_batches; batch++)
+    {
+        half2 data_in = reinterpret_cast<__half2*>(&in(batch, out_layer, gy, gx))[0];
+        // Bias
+        data_in += bias;
+
+        // Feature Elu
+        if (use_elu)
+        {
+            if (data_in.x <= (__half)0)
+            {
+                data_in.x = hexp(data_in.x) - (__half)1;
+            }
+        }
+
+        // mask Sigmoid
+        data_in.y = (__half)1 / (hexp(-data_in.y) + (__half)1);
+
+        // Output
+        out(batch, out_layer, gy, gx) = data_in.x * data_in.y;
+    }
+}
+
+
+__global__ void PreprocessParameters4(StaticDeviceTensor<float, 4> out_weight, StaticDeviceTensor<float, 1> out_bias,
+                                      StaticDeviceTensor<__half, 4> forward_weight,StaticDeviceTensor<__half, 4> mask_weight,
+                                      StaticDeviceTensor<__half, 1> forward_bias, StaticDeviceTensor<__half, 1> mask_bias)
+{
+    int out_layer = blockIdx.x;
+    int in_layer = blockIdx.y;
+    int dx = threadIdx.x;
+    int dy = threadIdx.y;
+    __half2 weight_in;
+    weight_in.x = forward_weight(out_layer, in_layer, dy, dx);
+    weight_in.y = mask_weight(out_layer, in_layer, dy, dx);
+    __half2* weight_dest = reinterpret_cast<__half2*>(&(out_weight(dx, dy, out_layer, in_layer)));
+    weight_dest[0]      = weight_in;
+    if(in_layer == 0 && dx == 0 && dy == 0){
+        __half2 bias_in;
+        bias_in.x = forward_bias(out_layer);
+        bias_in.y = mask_bias(out_layer);
+        __half2* bias_dest = reinterpret_cast<__half2*>(&(out_bias(out_layer)));
+        bias_dest[0]      = bias_in;
+    }
+}
+
 template <int output_channels, int calc_size, int work_size, int calc_width>
-__global__ void Forward3(StaticDeviceTensor<__half, 4> in, StaticDeviceTensor<float, 4> out, int width, int height , StaticDeviceTensor<float, 4> in_weight)
+__global__ void Forward4(StaticDeviceTensor<__half, 4> in, StaticDeviceTensor<float, 4> out, int width, int height , StaticDeviceTensor<float, 4> in_weight)
 {
     const int gx = blockIdx.x * 8;
     const int gy = blockIdx.y * 4;
@@ -330,9 +476,9 @@ __global__ void Forward3(StaticDeviceTensor<__half, 4> in, StaticDeviceTensor<fl
     {
         return;
     }
-    __shared__ __half shared_in[12][6][32];
-    if(gx==0 || gy == 0 || gx >width - 12 || gy > height - 6){
-        for (int dx = 0; dx < 12; dx++)
+    __shared__ __half shared_in[10][6][32];
+    if(gx==0 || gy == 0 || gx >width - 10 || gy > height - 6){
+        for (int dx = 0; dx < 10; dx++)
         {
             __half value = 0;
             int lx       = gx - 1 + dx;
@@ -386,7 +532,7 @@ __global__ void Forward3(StaticDeviceTensor<__half, 4> in, StaticDeviceTensor<fl
         }
     }else
     {
-        for (int dx = 0; dx < 12; dx++)
+        for (int dx = 0; dx < 10; dx++)
         {
             int lx       = gx - 1 + dx;
             int ly       = gy - 1 + threadIdx.y;
@@ -448,7 +594,7 @@ __global__ void Forward3(StaticDeviceTensor<__half, 4> in, StaticDeviceTensor<fl
 }
 
 template <bool use_elu>
-__global__ void Postprocess3(StaticDeviceTensor<float, 4> in, StaticDeviceTensor<__half, 4> out, int num_batches, int width, int height, StaticDeviceTensor<float, 1> in_bias)
+__global__ void Postprocess4(StaticDeviceTensor<float, 4> in, StaticDeviceTensor<__half, 4> out, int num_batches, int width, int height, StaticDeviceTensor<float, 1> in_bias)
 {
     const int gx = blockIdx.x * blockDim.x + threadIdx.x;
     const int gy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -482,7 +628,6 @@ __global__ void Postprocess3(StaticDeviceTensor<float, 4> in, StaticDeviceTensor
         out(batch, out_layer, gy, gx) = data_in.x * data_in.y;
     }
 }
-
 
 void MyConvUnet2d::ForwardMulti1(const torch::Tensor  data_in)
 {
@@ -526,6 +671,11 @@ void MyConvUnet2d::ForwardMulti1(const torch::Tensor  data_in)
             ::Forward1<32, 16, true>
                 <<<dim3(bx, by, 16), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
         }
+        else if (input_channels == 16 && output_channels == 4)
+        {
+            ::Forward1<16, 4, true>
+                <<<dim3(bx, by, 4), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
         else
         {
             std::cout << "IN : " << input_channels << "; OUT: " << output_channels << std::endl;
@@ -568,6 +718,11 @@ void MyConvUnet2d::ForwardMulti1(const torch::Tensor  data_in)
         {
             ::Forward1<32, 16, false>
                 <<<dim3(bx, by, 16), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1, bias1);
+        }
+        else if (input_channels == 16 && output_channels == 4)
+        {
+            ::Forward1<16, 4, false>
+                <<<dim3(bx, by, 4), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1, bias1);
         }
         else
         {
@@ -701,11 +856,110 @@ void MyConvUnet2d::ForwardMulti3(const torch::Tensor  data_in)
         else if (input_channels == 32 && output_channels == 60)
         {
             torch::Tensor permuted_data_in = data_in.permute({0, 3, 2, 1}).contiguous();
+
+            const int pixperblock = 1;
+            const int pixperwarp = 1;
+            ::Forward3<pixperwarp, 60><<<dim3(iDivUp(image_width, pixperwarp), iDivUp(image_height, pixperblock), 1), dim3(32,pixperblock,1)>>>(permuted_data_in, data_tmp, num_batches, image_width, image_height, weight3);
+            ::Postprocess3<true><<<dim3(iDivUp(image_width, 32), iDivUp(image_height, 8), output_channels), dim3(32, 8)>>>(data_tmp, data_out, num_batches, image_width, image_height, bias3);
+        }
+        else if (input_channels == 64 && output_channels == 124)
+        {
+            ::Forward1<64, 124, true>
+                <<<dim3(bx, by, 124), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else if (input_channels == 128 && output_channels == 64)
+        {
+            ::Forward1<128, 64, true>
+                <<<dim3(bx, by, 64), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else if (input_channels == 64 && output_channels == 32)
+        {
+            ::Forward1<64, 32, true>
+                <<<dim3(bx, by, 32), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1, bias1);
+        }
+        else if (input_channels == 32 && output_channels == 16)
+        {
+            ::Forward1<32, 16, true>
+                <<<dim3(bx, by, 16), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else
+        {
+            std::cout << "IN : " << input_channels << "; OUT: " << output_channels << std::endl;
+            SAIGA_EXIT_ERROR("invalid number of channels! ");
+        }
+    }
+    else
+    {
+        if (input_channels == 4 && output_channels == 16)
+        {
+            ::Forward1<4, 16, false>
+                <<<dim3(bx, by, 16), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else if (input_channels == 16 && output_channels == 28)
+        {
+            ::Forward1<16, 28, false>
+                <<<dim3(bx, by, 28), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else if (input_channels == 32 && output_channels == 60)
+        {
+            ::Forward1<32, 60, false>
+                <<<dim3(bx, by, 60), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else if (input_channels == 64 && output_channels == 124)
+        {
+            ::Forward1<64, 124, false>
+                <<<dim3(bx, by, 124), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else if (input_channels == 128 && output_channels == 64)
+        {
+            ::Forward1<128, 64, false>
+                <<<dim3(bx, by, 64), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else if (input_channels == 64 && output_channels == 32)
+        {
+            ::Forward1<64, 32, false>
+                <<<dim3(bx, by, 32), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else if (input_channels == 32 && output_channels == 16)
+        {
+            ::Forward1<32, 16, false>
+                <<<dim3(bx, by, 16), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1, bias1);
+        }
+        else
+        {
+            std::cout << "IN : " << input_channels << "; OUT: " << output_channels << std::endl;
+            SAIGA_EXIT_ERROR("invalid number of channels! ");
+        }
+    }
+
+    CUDA_SYNC_CHECK_ERROR();
+}
+
+void MyConvUnet2d::ForwardMulti4(const torch::Tensor  data_in)
+{
+    int bx = iDivUp(image_width, block_dim.x);
+    int by = iDivUp(image_height, block_dim.y);
+    SAIGA_ASSERT(bx > 0 && by > 0);
+
+    if (use_elu)
+    {
+        if (input_channels == 4 && output_channels == 16)
+        {
+            ::Forward1<4, 16, true><<<dim3(bx, by, 16), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1,  bias1);
+        }
+        else if (input_channels == 16 && output_channels == 28)
+        {
+            ::Forward1<16, 28, true>
+                <<<dim3(bx, by, 28), block_dim>>>(data_in, data_out, num_batches, image_width, image_height, weight1, bias1);
+        }
+        else if (input_channels == 32 && output_channels == 60)
+        {
+            torch::Tensor permuted_data_in = data_in.permute({0, 3, 2, 1}).contiguous();
             const int calc_size = 6;    //How large is the bounding rectangle
             const int work_size = calc_size-2; // How large is the cumpute rectangle
             const int calc_width = 2;   //Scale the width of the compute/bounding rectangle
-            ::Forward3<60, calc_size, work_size, calc_width><<<dim3(iDivUp(image_width, (work_size*calc_width)), iDivUp(image_height, work_size), num_batches), dim3(32,calc_size,1)>>>(permuted_data_in, data_tmp, image_width, image_height, weight3);
-            ::Postprocess3<true><<<dim3(iDivUp(image_width, 32), iDivUp(image_height, 8), output_channels), dim3(32, 8)>>>(data_tmp, data_out, num_batches, image_width, image_height, bias3);
+            ::Forward4<60, calc_size, work_size, calc_width><<<dim3(iDivUp(image_width, (work_size*calc_width)), iDivUp(image_height, work_size), num_batches), dim3(32,calc_size,1)>>>(permuted_data_in, data_tmp, image_width, image_height, weight4);
+            ::Postprocess4<true><<<dim3(iDivUp(image_width, 32), iDivUp(image_height, 8), output_channels), dim3(32, 8)>>>(data_tmp, data_out, num_batches, image_width, image_height, bias4);
         }
         else if (input_channels == 64 && output_channels == 124)
         {
@@ -807,6 +1061,10 @@ MyConvUnet2d::MyConvUnet2d(int input_channels, int output_channels, std::string 
                            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
     bias3 = torch::zeros({output_channels},
                            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+    weight4 = torch::zeros({kernel_size, kernel_size,output_channels, input_channels},
+                           torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+    bias4 = torch::zeros({output_channels},
+                           torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
 
 
 }
@@ -831,6 +1089,8 @@ void MyConvUnet2d::PushNewWeights(const torch::Tensor feature_weight, const torc
     ::PreprocessParameters1<<<dim3(output_channels, input_channels, 1), dim3(3,3,1)>>>(weight1, bias1, feature_weight.cuda().to(torch::kFloat16), mask_weight.cuda().to(torch::kFloat16), feature_bias.cuda().to(torch::kFloat16), mask_bias.cuda().to(torch::kFloat16));
     ::PreprocessParameters2<<<dim3(output_channels, input_channels, 1), dim3(3,3,1)>>>(weight2, bias2, feature_weight.cuda().to(torch::kFloat16), mask_weight.cuda().to(torch::kFloat16), feature_bias.cuda().to(torch::kFloat16), mask_bias.cuda().to(torch::kFloat16));
     ::PreprocessParameters3<<<dim3(output_channels, input_channels, 1), dim3(3,3,1)>>>(weight3, bias3, feature_weight.cuda().to(torch::kFloat16), mask_weight.cuda().to(torch::kFloat16), feature_bias.cuda().to(torch::kFloat16), mask_bias.cuda().to(torch::kFloat16));
+    ::PreprocessParameters4<<<dim3(output_channels, input_channels, 1), dim3(3,3,1)>>>(weight4, bias4, feature_weight.cuda().to(torch::kFloat16), mask_weight.cuda().to(torch::kFloat16), feature_bias.cuda().to(torch::kFloat16), mask_bias.cuda().to(torch::kFloat16));
+
 
     CUDA_SYNC_CHECK_ERROR();
 }
@@ -847,14 +1107,15 @@ torch::Tensor MyConvUnet2d::Forward(const torch::Tensor data_in)
     data_out = torch::zeros({num_batches, output_channels, image_height, image_width},
         torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16));
 
-    //TODO ggf nur einmal
     data_tmp = torch::zeros({num_batches, output_channels, image_height, image_width},
                             torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
 
     SAIGA_ASSERT(data_in.is_cuda() == true);
     SAIGA_ASSERT(data_in.dtype() == torch::kFloat16);
     //CALCULATE OUTPUT
-    ForwardMulti3(data_in);
+
+    //TODO Hier wählen zwischen den 4 Ansätzen
+    ForwardMulti1(data_in);
 
     //RETURN OUTPUT
     return std::move(data_out);

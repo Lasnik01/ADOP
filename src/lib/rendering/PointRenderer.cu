@@ -43,8 +43,8 @@ __device__ inline vec3 colorizeTurbo(float x)
 }
 
 static constexpr int default_block_size        = 256;
-static constexpr int default_points_per_thread_depth_prepass = 8;
-static constexpr int default_points_per_thread_render_forward = 16;
+static constexpr int default_points_per_thread_depth_prepass = 16;
+static constexpr int default_points_per_thread_render_forward = 8;
 
 struct DeviceRenderParams
 {
@@ -364,7 +364,7 @@ __global__ void RenderForwardMulti(DevicePointCloud point_cloud, float* dropout_
         for (int batch = 0; batch < num_batches; batch++)
         {
             bool drop_out = (dropout_p + dropout_offset * batch)[point_id] == 1;
-            if (drop_out) continue; 
+            if (drop_out) return;  // todo only one batch fail
 
             vec2 ip;
             float z;
@@ -1519,7 +1519,6 @@ std::pair<std::vector<torch::Tensor>, std::vector<torch::Tensor>> BlendPointClou
             scene.BuildOutlierCloud(params.outlier_count);
         }
     }
-
 
 
     {

@@ -54,6 +54,7 @@ add_app(speed_measurement FALSE)
 add_executable(u_net_test u_net_test.cpp u_net_test.h)
 add_app(u_net_test FALSE)
 
+
 if (TARGET saiga_opengl)
     add_executable(adop_viewer adop_viewer.cpp adop_viewer.h)
     add_app(adop_viewer FALSE)
